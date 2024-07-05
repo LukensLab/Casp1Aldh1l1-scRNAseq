@@ -215,6 +215,35 @@ rm(small.counts,sum.exp,colDataframe,filter,KOast,mg,nControl,res.summary,dds,re
 ```
 
 
+What cell type are the DEGs coming from?
+
+```{r}
+
+allcells_zinbwave_sig_genes <- read_excel("results/allcells_zinbwave_sig_genes.xlsx")
+
+sig.genes <- allcells_zinbwave_sig_genes$Gene
+sig.genes.1to50 <- sig.genes[1:50]
+sig.genes.51to100 <- sig.genes[51:100]
+sig.genes.101to166 <- sig.genes[101:166]
+
+pdf("allcells.zinb.degs.cluster.dotplot.1.pdf",width=17,height=4)
+DotPlot(seurat_clustered_labeled, 
+        features = sig.genes.1to50) + theme(axis.text.x = element_text(size = 10)) + xlab(" ") + ylab(" ") + RotatedAxis()
+dev.off()
+
+pdf("allcells.zinb.degs.cluster.dotplot.2.pdf",width=17,height=4)
+DotPlot(seurat_clustered_labeled, 
+        features = sig.genes.51to100) + theme(axis.text.x = element_text(size = 10)) + xlab(" ") + ylab(" ") + RotatedAxis()
+dev.off()
+
+pdf("allcells.zinb.degs.cluster.dotplot.3.pdf",width=17,height=4)
+DotPlot(seurat_clustered_labeled, 
+        features = sig.genes.101to166) + theme(axis.text.x = element_text(size = 10)) + xlab(" ") + ylab(" ") + RotatedAxis()
+dev.off()
+
+```
+
+
 # Astrocyte DEA 
 
 ```{r}
