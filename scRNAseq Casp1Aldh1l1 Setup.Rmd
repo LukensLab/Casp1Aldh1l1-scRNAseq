@@ -18,8 +18,7 @@ This is a compilation of multiple scRNAseq R scripts from the lab. It will take 
 * PCA
 * UMAP/tSNE clustering
 * Cluster identification
-* Sub-clustering
-* Differential expression analysis
+
 
 ```{r}
 # Define input, results, and figures directories 
