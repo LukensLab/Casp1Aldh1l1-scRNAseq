@@ -1,0 +1,757 @@
+---
+title: "Casp1Aldh1l1_scRNAseq_reviewers"
+author: "Kristine Zengeler"
+date: "2024-06-27"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Load libraries
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(ggridges)
+library(BiocManager)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(patchwork)
+library(ggraph)
+library(clustree)
+library(metap)
+library(limma)
+library(DESeq2)
+library(EnhancedVolcano)
+library(RColorBrewer)
+library(sctransform)
+library(openxlsx)
+library(zinbwave)
+```
+
+# Function setup to create stacked violin plots
+
+```{r}
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature, pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(), axis.ticks.x = element_line())
+  
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+```
+
+# Import data
+
+```{r}
+
+# processed, clustered data with labeled cell populations
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+# the file is called seurat_clustered_labeled
+
+```
+
+
+# Set working directory
+
+```{r}
+resDir = "~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/"
+dir.create("Reviewers")
+setwd(paste0(resDir, "/Reviewers"))
+```
+
+
+
+
+# Reviewer 2: "Near line 335 when scRNAseq is used, the results should provide greater details on the numbers of cells, numbers of mice, and critically on the numbers of astrocytes. Any quality control used to validate the data should be mentioned."
+
+Response:
+1. number of cells is included already in Figure S6A
+2. assemble astrocyte counts
+3. generate plots of the QC measures used in data pre-processing
+
+
+Plots for QC metrics
+```{r}
+# plots were generated for the QC metrics in the original pipeline and are saved in the "QC metrics folder -- this will be provided to the reviewer
+
+# Filtering metrics to note for the reviewer to remove low quality reads using selected thresholds
+# nUMI >= 400 # remove nuclei with low reads
+# nGene >= 350 # remove nuclei with low genes per nuclei
+# nGene <= 5000 # remove nuclei with really high genes per nuclei (doublets)
+# log10GenesPerUMI > 0.80 # remove nuclei with low complexity (genes/reads)
+# mitoRatio < 0.1 # remove nuclei with higher mitochondrial genes
+
+```
+
+Total cell counts 
+
+```{r}
+
+# Let's count them up!
+metadata_clean <- seurat_clustered_labeled@meta.data
+length(metadata_clean$sample[metadata_clean$sample == "Control"]) # 10,444 cells
+length(metadata_clean$sample[metadata_clean$sample == "KOast"]) # 17,864 cells
+
+# Same plot that is already included, but fixing the colors to match those used in other figures
+pdf("tSNE_splitsample.pdf",width=6,height=5)                           
+DimPlot(seurat_clustered_labeled, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+dev.off()
+
+```
+
+
+Total cell counts and proportions
+```{r}
+
+# Check the tsne plot
+DimPlot(seurat_clustered_labeled, 
+        reduction = "tsne", 
+        repel = T, 
+        label.box = T,
+        label = TRUE) + NoLegend()
+
+
+
+# Extract cell identities and sample information from seurat object 
+n_cells <- FetchData(seurat_clustered_labeled, 
+                     vars = c("ident", "sample")) %>%
+        dplyr::count(ident, sample)
+
+
+# PLOT: number of cells per cluster by sample
+pdf("cell_counts.pdf",width=13,height=6)
+ggplot(n_cells, 
+              aes(x=ident, y=n, fill=sample)) +
+              ylim(0,8000) +
+              theme_classic() +
+              theme(axis.text.x = element_text(color="#000000", size=12),
+              axis.text.y = element_text(color="#000000", size=12),
+              axis.title.y = element_text(size = 12)) +
+              scale_x_discrete(labels=
+                                 c("Astrocytes" = "Astro",
+                                         "Microglia" = "Microglia",
+                                         "Endothelial Cells" = "EC",
+                                         "Oligodendrocytes" = "Olig",
+                                         "Pericytes" = "Pericyte",
+                                         "Smooth Muscle Cells" = "SMC",
+                                         "Neurons" = "Neuron",
+                                         "OPCs" = "OPC",
+                                         "BAMs" = "BAM",
+                                         "Tanycytes" = "Tanycyte",
+                                         "Immature Neurons" = "ImmNeur",
+                                         "T cells" = "T cell",
+                                         "CP cells" = "CPC",
+                                         "Fibroblasts" = "Fibro",
+                                         "B cells" = "B cell",
+                                         "Macrophages" = "Mac")) +
+              scale_fill_manual(values=c("grey75", "seagreen2")) +
+              xlab(" ") + 
+              ylab("Number of cells") +
+              geom_bar(position=position_dodge(), 
+              stat="identity") +
+              geom_text(aes(label=n), 
+              vjust = -.2, 
+              position=position_dodge(1)) + NoLegend()
+dev.off()
+
+
+# PLOT: proportion of cells in each cluster by sample
+pdf("cell_proportions.pdf",width=5,height=8)
+ggplot(seurat_clustered_labeled@meta.data) +
+    theme_classic() +
+    theme(axis.text.x = element_text(color="#000000",size=12),
+              axis.text.y = element_text(color="#000000", size=12),
+          axis.title.x = element_text(size = 12)) +
+    scale_x_discrete(labels=
+                    c("0" = "Astrocytes",
+                                         "1" = "Microglia", 
+                                         "2" = "Endothelial Cells",
+                                         "3" = "Oligodendrocytes",
+                                         "4" = "Astrocytes",
+                                         "5" = "Smooth Muscle Cells",
+                                         "6" = "Pericytes",
+                                         "7" = "Microglia",
+                                         "8" = "Astrocytes",
+                                         "9" = "Endothelial Cells",
+                                         "10" = "Neurons",
+                                         "11" = "OPCs",
+                                         "12" = "Neurons",
+                                         "13" = "BAMs",
+                                         "14" = "Oligodendrocytes",
+                                         "15" = "Tanycytes",
+                                         "16" = "CP cells",
+                                         "17" = "Immature Neurons",
+                                         "18" = "T cells",
+                                         "19" = "Astrocytes",
+                                         "20" = "Macrophages", 
+                                         "21" = "Oligodendrocytes", 
+                                         "22" = "Pericytes",
+                                         "23" = "Fibroblasts",
+                                         "24" = "Endothelial Cells", 
+                                         "25" = "B cells",
+                                         "26" = "Endothelial Cells",
+                                         "27" = "Immature Neurons")) +
+    scale_fill_manual(values=c("grey75", "seagreen2")) +
+    xlab(" ") + 
+    ylab("Proportion of cells") +
+    coord_flip() +
+    geom_bar(aes(x=integrated_snn_res.0.4, 
+                 fill=sample), 
+                  position=position_fill()) + NoLegend()
+dev.off()
+
+```
+
+
+
+# Reviewer 1: "Although some genes are found to change in the major glial cell populations, no mentioning is made on neurons (where I would expect potential changes in synaptic genes linked to previous figures)."
+
+Response: 
+1. assemble neuron counts to show that neurons were captured only in low numbers
+2. the neurons that were captured express immature markers, and low levels of synaptic proteins
+
+Neuron marker analysis
+```{r}
+
+# Subset to keep only the neuron cluster
+neuron_seurat <- subset(seurat_clustered_labeled,
+                        idents = c(
+                          "Neurons",
+                          "Immature Neurons"),
+                        invert = FALSE) 
+
+
+
+# check new subsetted seurat
+pdf("neuron_subset.pdf",width=6,height=4.5)
+DimPlot(object = neuron_seurat, 
+        reduction = "tsne",
+        cols = c("slateblue1", "slategray4"),)
+dev.off()
+
+
+# breakdown by genotype
+pdf("neuron_subset_bygenotype.pdf",width=6,height=5)                           
+DimPlot(neuron_seurat, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+dev.off()
+
+
+# number of neurons per group
+metadata_clean <- neuron_seurat@meta.data
+length(metadata_clean$sample[metadata_clean$sample == "Control"]) # 483 cells
+length(metadata_clean$sample[metadata_clean$sample == "KOast"]) # 802 cells
+
+
+# neuron subset marker expression across all cell types
+
+#mature neuron
+StackedVlnPlot(obj = seurat_clustered_labeled, features = c("Rbfox3","Map2","Gap43","Syp", "Dlg4", "Bsn"))
+#immature neuron
+StackedVlnPlot(obj = seurat_clustered_labeled, features = c("Dcx","Ncam1","Neurod1"))
+#serotonergic neurons
+StackedVlnPlot(obj = seurat_clustered_labeled, features = c("Gli2", "Oxtr", "Tacr3"))
+#excitatory neurons
+StackedVlnPlot(obj = seurat_clustered_labeled, features = c("Cux2","Nrgn","Slc17a7","Tbr1"))
+#inhibitory neurons
+StackedVlnPlot(obj = seurat_clustered_labeled, features = c("Gad1","Pvalb","Slc32a1","Sst","Vip"))
+
+# composite
+StackedVlnPlot(obj = seurat_clustered_labeled, 
+               features = c("Rbfox3","Map2","Gap43","Syp","Nrgn","Slc17a7","Tbr1","Dlg4","Bsn","Dcx","Ncam1","Neurod1"))
+
+# PLOT: composite, neurons only, pt 1
+pdf("neuron_subset_lineage_markers1.pdf",width=6,height=10)
+StackedVlnPlot(obj = neuron_seurat, 
+               features = c("Rbfox3","Map2","Gap43","Syp","Nrgn","Slc17a7"),
+               cols = c("slateblue1", "slategray4"))
+dev.off()
+
+# PLOT: pt 2
+pdf("neuron_subset_lineage_markers2.pdf",width=6,height=10)
+StackedVlnPlot(obj = neuron_seurat, 
+               features = c("Tbr1","Dlg4","Bsn","Dcx","Ncam1","Neurod1"),
+               cols = c("slateblue1", "slategray4"))
+dev.off()
+
+
+# synaptic marker expression
+pdf("neuron_subset_postsynapse_markers.pdf",width=6,height=9)
+StackedVlnPlot(obj = neuron_seurat, 
+               features = c("Gria1","Grin1","Dlg4","Homer1","Nlgn2","Gabra1","Shank1"),
+               cols = c("slateblue1", "slategray4")) 
+dev.off()
+
+pdf("neuron_subset_presynapse_markers.pdf",width=6,height=9)
+StackedVlnPlot(obj = neuron_seurat, 
+               features = c("Syp","Syn1","Syt1","Vamp2","Nrxn1","Nrcam","Stx1a"),
+               cols = c("slateblue1", "slategray4"))
+dev.off()
+
+
+# combine all neurons into one category
+seurat_clustered_labeled_condensed <- RenameIdents(seurat_clustered_labeled, 
+                                         "Astrocytes" = "Astrocytes",
+                                         "Microglia" = "Microglia",
+                                         "Endothelial Cells" = "ECs",
+                                         "Oligodendrocytes" = "Oligos",
+                                         "Pericytes" = "Pericytes",
+                                         "Smooth Muscle Cells" = "SMCs",
+                                         "Neurons" = "Neurons",
+                                         "OPCs" = "OPCs",
+                                         "BAMs" = "BAMs",
+                                         "Tanycytes" = "Tanycytes",
+                                         "Immature Neurons" = "Neurons",
+                                         "T cells" = "T cells",
+                                         "CP cells" = "CP Cells",
+                                         "Fibroblasts" = "Fibroblasts",
+                                         "B cells" = "B cells",
+                                         "Macrophages" = "Macrophages"
+)
+
+
+# synaptic marker expression
+pdf("neuron_subset_postsynapse_markers.pdf",width=2.5,height=9)
+StackedVlnPlot(obj = seurat_clustered_labeled_condensed, 
+               idents = c("Neurons"),
+               features = c("Gria1","Grin1","Dlg4","Homer1","Nlgn2","Gabra1","Shank1"),
+               cols = c("slateblue1"))
+dev.off()
+
+pdf("neuron_subset_presynapse_markers.pdf",width=2.5,height=9)
+StackedVlnPlot(obj = seurat_clustered_labeled_condensed, 
+               idents = c("Neurons"),
+               features = c("Syp","Syn1","Syt1","Vamp2","Nrxn1","Nrcam","Stx1a"),
+               cols = c("slateblue1"))
+dev.off()
+
+
+
+# synaptic marker expression, split by genotype
+pdf("neuron_subset_postsynapse_markers_genotype.pdf",width=2.5,height=9)
+StackedVlnPlot(obj = seurat_clustered_labeled_condensed, 
+               idents = c("Neurons"),
+               features = c("Gria1","Grin1","Dlg4","Homer1","Nlgn2","Gabra1","Shank1"),
+               split.by = "orig.ident",
+               cols = c("grey75", "seagreen2"))
+dev.off()
+
+pdf("neuron_subset_presynapse_markers_genotype.pdf",width=2.5,height=9)
+StackedVlnPlot(obj = seurat_clustered_labeled_condensed, 
+               idents = c("Neurons"),
+               features = c("Syp","Syn1","Syt1","Vamp2","Nrxn1","Nrcam","Stx1a"),
+               split.by = "orig.ident",
+               cols = c("grey75", "seagreen2"))
+dev.off()
+
+```
+
+
+
+
+# Reviewer 1: "In astrocytes themselves, 82 differentially expressed genes were found and annotated to GO terms, but then the authors skip them and conclude on showing that S100b and GFAP are modestly upregulated at the protein level (though no mention was made of the actual RNA level of these very same proteins in their scRNAseq dataset)."
+
+Response: plot S100b and Gfap expression between groups
+
+```{r}
+
+# subset the astrocytes
+astro_seurat <- subset(seurat_clustered_labeled,
+                    idents = c("Astrocytes"),
+                    invert = FALSE)
+
+# check
+pdf("astro_subset_bygenotype.pdf",width=6,height=5)   
+DimPlot(astro_seurat, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+dev.off()
+
+# number of astrocytes per group
+metadata_clean <- astro_seurat@meta.data
+length(metadata_clean$sample[metadata_clean$sample == "Control"]) # 4185 cells
+length(metadata_clean$sample[metadata_clean$sample == "KOast"]) # 7172 cells
+
+
+# astrocyte inflammatory gene expression, by genotype
+pdf("astro_subset_inflammation_markers_genotype.pdf",width=6,height=10)
+StackedVlnPlot(obj = astro_seurat, 
+               features = c("S100b","Gfap","Vim","Nfkb1","Tnf","Nos2"),
+               split.by = "orig.ident",
+               cols = c("grey75", "seagreen2"))
+dev.off()
+
+```
+
+
+
+# Reviewer 4: "9. Results, Line 483: The authors cite a transcriptome database study to argue that astrocytes express the most Il18 at baseline, however this is not obvious within the cited manuscript. Alternatively, the authors should leverage their own scRNAseq database in Fig. 4 to reach the same conclusion."
+
+Response: 
+1. plot Il18, Il1b, and Il33 expression levels between groups
+2. mention that it is not possible to analyze neuronal expression due to low neuron capture rate in this dataset
+
+
+```{r}
+
+# astrocyte inflammatory gene expression, by genotype
+pdf("astro_subset_cytokine_genotype.pdf",width=6,height=10)
+StackedVlnPlot(obj = astro_seurat, 
+               features = c("Il1b","Il1a","Il18","Il33","Il1r1","Il1rl1"),
+               split.by = "orig.ident",
+               cols = c("grey75", "seagreen2"))
+dev.off()
+
+
+# neuron inflammatory gene expression, by genotype
+pdf("neuron_subset_cytokine_genotype.pdf",width=6,height=10)
+StackedVlnPlot(obj = seurat_clustered_labeled_condensed,
+               idents = c("Neurons"),
+               features = c("Il1b","Il1a","Il18","Il33","Il1r1","Il18r1","Il1rl1"),
+               split.by = "orig.ident",
+               cols = c("grey75", "seagreen2"))
+dev.off()
+
+
+# cytokine signaling across all cell types, collapsed over genotype
+pdf("dotplot_cytokines.pdf",width=6,height=5)
+DotPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il1b","Il1a","Il18","Il33","Il1r1","Il18r1","Il1rl1")) +
+    xlab(" ") + 
+    ylab(" ") +
+    RotatedAxis()
+dev.off()
+
+
+pdf("dotplot_cytokines_condensed.pdf",width=5.5,height=3.5)
+DotPlot(seurat_clustered_labeled_condensed, 
+        idents = c("Neurons","Astrocytes","Oligos","Microglia","OPCs"),
+        features = c("Il1b","Il1a","Il18","Il33","Il1r1","Il18r1","Il1rl1")) +
+    xlab(" ") + 
+    ylab(" ") +
+    RotatedAxis()
+dev.off()
+
+
+# il18 expression across cell types
+pdf("violin_il18_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il18"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("featureplot_il18.pdf",width=5,height=5)
+FeaturePlot(seurat_clustered_labeled, 
+            reduction = "tsne",
+        features = c("Il18")) 
+dev.off()
+
+pdf("dotplot_il18_il18r.pdf",width=4,height=5)
+DotPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il18","Il18r1")) +
+    xlab(" ") + 
+    ylab(" ") +
+    RotatedAxis()
+dev.off()
+
+
+# il18r expression across cell types
+pdf("violin_il18r1_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il18r1"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("featureplot_il18r1.pdf",width=5,height=5)
+FeaturePlot(seurat_clustered_labeled, 
+            reduction = "tsne",
+        features = c("Il18r1")) 
+dev.off()
+
+
+```
+
+
+
+# Reviewer #1: 12) Fig 6A, the authors conclude that more IL-33 is expressed in astrocytes and neurons in Casp1 astrocyte-specific KO mice. My first question is, did the authors find an increased IL33 mRNA in their scRNAseq dataset, and if not, could they at least perform an qPCR from sorted astrocytes and sorted neurons to corroborate these staining data. Without this, it would seem very premature to conclude that “casp1 loss in astrocytes drives both astrocytes and neurons to produce more IL33” (lines 434-435). IL-33 may be internalized in neurons from other sources.
+
+Response: assess il33 expression across hippocampal cell types at baseline and in the cKOs
+
+```{r}
+
+# il33 expression across cell types
+pdf("violin_il33_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il33"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("featureplot_il33.pdf",width=5,height=5)
+FeaturePlot(seurat_clustered_labeled, 
+            reduction = "tsne",
+        features = c("Il33")) 
+dev.off()
+
+
+# st2 expression across cell types
+pdf("violin_st2_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il1rl1"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("featureplot_st2.pdf",width=5,height=5)
+FeaturePlot(seurat_clustered_labeled, 
+            reduction = "tsne",
+        features = c("Il1rl1")) 
+dev.off()
+
+
+pdf("dotplot_il33_st2.pdf",width=4,height=5)
+DotPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il33","Il1rl1")) +
+    xlab(" ") + 
+    ylab(" ") +
+    RotatedAxis()
+dev.off()
+
+
+# il18 and il33 expression in neurons and astrocytes only
+
+pdf("dotplot_astro_neuron_il18_il33.pdf",width=5.5,height=2)
+DotPlot(seurat_clustered_labeled_condensed, 
+        idents = c("Neurons","Astrocytes"),
+        features = c("Il1b","Il1a","Il18","Il33","Il1r1","Il18r1","Il1rl1")) +
+    xlab(" ") + 
+    ylab(" ") +
+    RotatedAxis()
+dev.off()
+
+
+pdf("violin_astro_neuron_il18_il33_genotype.pdf",width=4.5,height=6)
+StackedVlnPlot(obj = seurat_clustered_labeled_condensed,
+               idents = c("Neurons","Astrocytes"),
+               features = c("Il18","Il33","Il18r1","Il1rl1"),
+               split.by = "orig.ident",
+               cols = c("grey75", "seagreen2"))
+dev.off()
+
+```
+
+
+# Other, for funsies
+
+Plotting expression of inflammasome components across cell types
+
+```{r}
+
+pdf("violin_nlrp3_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Nlrp3"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("violin_aim2_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Aim2"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("violin_casp1_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Casp1"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("violin_pycard_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Pycard"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("violin_il1b_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Il1b"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("violin_gsdmd_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Gsdmd"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+pdf("violin_gsdme_allcells.pdf",width=6,height=4)
+VlnPlot(seurat_clustered_labeled_condensed, 
+        features = c("Gsdme"),
+        pt.size=0) +
+      xlab(" ") +
+      theme(legend.position = 'none')
+dev.off()
+
+```
+
+
+
+
+
+
+```{r}
+sessionInfo()
+
+#R version 4.3.3 (2024-02-29)
+#Platform: aarch64-apple-darwin20 (64-bit)
+#Running under: macOS Sonoma 14.5
+
+#Matrix products: default
+#BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+#LAPACK: /Library/Frameworks/R.framework/Versions/4.3-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.11.0
+
+#locale:
+#[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+#time zone: America/New_York
+#tzcode source: internal
+
+#attached base packages:
+#[1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+#other attached packages:
+# [1] glmGamPoi_1.14.3            zinbwave_1.24.0             SingleCellExperiment_1.24.0
+# [4] openxlsx_4.2.5.2            sctransform_0.4.1           RColorBrewer_1.1-3         
+# [7] EnhancedVolcano_1.20.0      ggrepel_0.9.5               DESeq2_1.42.1              
+#[10] SummarizedExperiment_1.32.0 Biobase_2.62.0              MatrixGenerics_1.14.0      
+#[13] matrixStats_1.3.0           GenomicRanges_1.54.1        GenomeInfoDb_1.38.8        
+#[16] IRanges_2.36.0              S4Vectors_0.40.2            BiocGenerics_0.48.1        
+#[19] limma_3.58.1                metap_1.10                  clustree_0.5.1             
+#[22] ggraph_2.2.1                patchwork_1.2.0             magrittr_2.0.3             
+#[25] BiocManager_1.30.23         ggridges_0.5.6              RCurl_1.98-1.14            
+#[28] cowplot_1.1.3               scales_1.3.0                Matrix_1.6-5               
+#[31] lubridate_1.9.3             forcats_1.0.0               stringr_1.5.1              
+#[34] dplyr_1.1.4                 purrr_1.0.2                 readr_2.1.5                
+#[37] tidyr_1.3.1                 tibble_3.2.1                ggplot2_3.5.1              
+#[40] tidyverse_2.0.0             Seurat_5.1.0                SeuratObject_5.0.2         
+#[43] sp_2.1-4                   
+
+#loaded via a namespace (and not attached):
+#  [1] spatstat.sparse_3.1-0     bitops_1.0-7              httr_1.4.7               
+#  [4] numDeriv_2016.8-1.1       tools_4.3.3               utf8_1.2.4               
+#  [7] R6_2.5.1                  lazyeval_0.2.2            uwot_0.1.16              
+# [10] sn_2.1.1                  withr_3.0.0               gridExtra_2.3            
+# [13] progressr_0.14.0          cli_3.6.3                 spatstat.explore_3.2-7   
+# [16] fastDummies_1.7.3         sandwich_3.1-0            labeling_0.4.3           
+# [19] mvtnorm_1.2-5             spatstat.data_3.1-2       genefilter_1.84.0        
+# [22] pbapply_1.7-2             parallelly_1.37.1         plotrix_3.8-4            
+# [25] rstudioapi_0.16.0         RSQLite_2.3.7             generics_0.1.3           
+# [28] ica_1.0-3                 spatstat.random_3.2-3     zip_2.3.1                
+# [31] fansi_1.0.6               abind_1.4-5               lifecycle_1.0.4          
+# [34] multcomp_1.4-25           yaml_2.3.8                edgeR_4.0.16             
+# [37] mathjaxr_1.6-0            SparseArray_1.2.4         Rtsne_0.17               
+# [40] grid_4.3.3                blob_1.2.4                promises_1.3.0           
+# [43] crayon_1.5.3              miniUI_0.1.1.1            lattice_0.22-6           
+# [46] annotate_1.80.0           KEGGREST_1.42.0           pillar_1.9.0             
+# [49] knitr_1.47                future.apply_1.11.2       codetools_0.2-20         
+# [52] leiden_0.4.3.1            mutoss_0.1-13             glue_1.7.0               
+# [55] data.table_1.15.4         vctrs_0.6.5               png_0.1-8                
+# [58] spam_2.10-0               Rdpack_2.6                gtable_0.3.5             
+# [61] cachem_1.1.0              xfun_0.45                 rbibutils_2.2.16         
+# [64] S4Arrays_1.2.1            mime_0.12                 tidygraph_1.3.1          
+# [67] survival_3.7-0            statmod_1.5.0             fitdistrplus_1.1-11      
+# [70] TH.data_1.1-2             ROCR_1.0-11               nlme_3.1-165             
+# [73] bit64_4.0.5               RcppAnnoy_0.0.22          irlba_2.3.5.1            
+# [76] KernSmooth_2.23-24        colorspace_2.1-0          DBI_1.2.3                
+# [79] mnormt_2.1.1              tidyselect_1.2.1          bit_4.0.5                
+# [82] compiler_4.3.3            TFisher_0.2.0             DelayedArray_0.28.0      
+# [85] plotly_4.10.4             lmtest_0.9-40             digest_0.6.36            
+# [88] goftest_1.2-3             spatstat.utils_3.0-5      rmarkdown_2.27           
+# [91] XVector_0.42.0            htmltools_0.5.8.1         pkgconfig_2.0.3          
+# [94] sparseMatrixStats_1.14.0  fastmap_1.2.0             rlang_1.1.4              
+# [97] htmlwidgets_1.6.4         shiny_1.8.1.1             DelayedMatrixStats_1.24.0
+#[100] farver_2.1.2              zoo_1.8-12                jsonlite_1.8.8           
+#[103] BiocParallel_1.36.0       GenomeInfoDbData_1.2.11   dotCall64_1.1-1          
+#[106] munsell_0.5.1             Rcpp_1.0.12               viridis_0.6.5            
+#[109] reticulate_1.37.0         stringi_1.8.4             zlibbioc_1.48.2          
+#[112] MASS_7.3-60.0.1           plyr_1.8.9                parallel_4.3.3           
+#[115] listenv_0.9.1             deldir_2.0-4              Biostrings_2.70.3        
+#[118] graphlayouts_1.1.1        splines_4.3.3             tensor_1.5               
+#[121] multtest_2.58.0           hms_1.1.3                 locfit_1.5-9.10          
+#[124] qqconf_1.3.2              igraph_2.0.3              spatstat.geom_3.2-9      
+#[127] RcppHNSW_0.6.0            softImpute_1.4-1          reshape2_1.4.4           
+#[130] XML_3.99-0.17             evaluate_0.24.0           tzdb_0.4.0               
+#[133] tweenr_2.0.3              httpuv_1.6.15             RANN_2.6.1               
+#[136] polyclip_1.10-6           future_1.33.2             scattermore_1.2          
+#[139] ggforce_0.4.2             xtable_1.8-4              RSpectra_0.16-1          
+#[142] later_1.3.2               viridisLite_0.4.2         memoise_2.0.1            
+#[145] AnnotationDbi_1.64.1      cluster_2.1.6             timechange_0.3.0         
+#[148] globals_0.16.3  
+```
+

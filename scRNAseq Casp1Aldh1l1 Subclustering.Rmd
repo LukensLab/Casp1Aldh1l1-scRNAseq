@@ -1,0 +1,1946 @@
+---
+title: "scRNAseq Casp1Aldh1l1 Subclustering"
+author: "Kristine Zengeler"
+date: "2024-07-01"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Load libraries
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(ggridges)
+library(BiocManager)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(patchwork)
+library(ggraph)
+library(clustree)
+library(metap)
+library(limma)
+library(DESeq2)
+library(EnhancedVolcano)
+library(RColorBrewer)
+library(sctransform)
+library(openxlsx)
+library(zinbwave)
+library(glmGamPoi)
+
+```
+
+# Function setup to create stacked violin plots
+
+```{r}
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature, pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(), axis.ticks.x = element_line())
+  
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+```
+
+# Import data
+
+```{r}
+# processed, clustered data with labeled cell populations
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+
+```
+
+
+# Set working directory
+
+```{r}
+resDir = "~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/"
+setwd(resDir)
+dir.create("Subclustering")
+setwd(paste0(resDir, "/Subclustering"))
+```
+
+
+
+# Highlighting individual clusters and subclustering!
+
+# First, astrocytes.
+
+```{r}
+DimPlot(seurat_clustered_labeled, reduction = "tsne") 
+
+
+# Create tSNE highlighting only the astrocyte cluster (make all other clusters grey)
+pdf("tSNE_astrocyte_cluster_highlight.pdf")
+DimPlot(object = seurat_clustered_labeled, 
+                     reduction = "tsne", label = TRUE, 
+        repel = T, label.box = T, pt.size = .8, cols = c(
+                       "seagreen3",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75"))+ NoLegend()
+dev.off() 
+
+# Subset to keep only the astrocyte cluster
+astro_seurat <- subset(seurat_clustered_labeled,
+                    idents = c("Astrocytes"),
+                    invert = FALSE) # invert FALSE here will keep only the selected cluster
+
+# check new subsetted seurat
+DimPlot(object = astro_seurat, reduction = "tsne")
+
+#### Save the astrocyte subsetted Seurat
+save(astro_seurat, file = paste0(resDir, "astro_seurat.Rdata"))
+
+```
+
+
+
+```{r}
+
+# Load labeled clustered Seurat of interest
+load(paste0(resDir, "astro_seurat.Rdata"))
+
+# Create specific directory for this output
+setwd(resDir)
+dir.create("Astrocytes")
+setwd(paste0(resDir, "Astrocytes/"))
+
+
+## Cleanup the data
+subset_seurat <- astro_seurat
+DefaultAssay(subset_seurat) <- "RNA"
+subset_seurat <- DietSeurat(subset_seurat, assays = "RNA")
+subset_seurat@meta.data[["integrated_snn_res.0.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.2"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.6"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.8"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.4"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.8"]] <- NULL
+subset_seurat@meta.data[["seurat_clusters"]] <- NULL
+```
+
+Redo SCTransform
+
+```{r}
+#This method is based off https://github.com/satijalab/seurat/issues/1883. 
+
+##### Re-SCTransform
+
+# split seurat object by sample
+subset.sct.list <-SplitObject(subset_seurat, split.by = "sample")
+# normalize and identify variable features for each seurat object independently
+subset.sct.list <- lapply(X = subset.sct.list, FUN = SCTransform)
+# select features that are repeatedly variable across seurat objects for integration
+subset.sct.features <- SelectIntegrationFeatures(object.list = subset.sct.list, nfeatures = 3000)
+# pep for integration steps
+subset.sct.list <- PrepSCTIntegration(object.list = subset.sct.list, anchor.features = subset.sct.features)
+# identifies anchors for integration - takes a long time!
+subset.sct.anchors <- FindIntegrationAnchors(object.list = subset.sct.list, 
+                                             normalization.method = "SCT", 
+                                             anchor.features = subset.sct.features)
+# perform integration
+sct_subset_seurat <- IntegrateData(anchorset = subset.sct.anchors, normalization.method = "SCT")
+
+# Remove SCTransform prep objects from the environment
+rm(subset_seurat)
+rm(subset.sct.anchors)
+rm(subset.sct.list)
+rm(subset.sct.features)
+```
+
+Reclustering with new PCA and tSNE
+
+```{r}
+# Rename seurat
+subset_seurat_integrated <- sct_subset_seurat
+# remove unused data from environment
+rm(sct_subset_seurat)
+
+# use integrated data to assess dimensionality and resolution
+DefaultAssay(subset_seurat_integrated) <- "integrated"
+### PCA
+# Run PCA
+subset_seurat_integrated <- RunPCA(object = subset_seurat_integrated, verbose = FALSE)
+### Check dimensionality
+ElbowPlot(subset_seurat_integrated, ndims = 50)
+
+## Re-tSNE
+seurat_integrated_tsne <- RunTSNE(subset_seurat_integrated, dims = 1:50)
+DimPlot(object = seurat_integrated_tsne, 
+        reduction = "tsne", 
+        label = TRUE) + NoLegend()
+
+### Clustering
+
+# Determine the K-nearest neighbor graph
+subset_seurat_integrated <- FindNeighbors(object = seurat_integrated_tsne, dims = 1:50, verbose = FALSE)
+# Determine the clusters for various resolutions                                
+subset_seurat_integrated <- FindClusters(object = subset_seurat_integrated,
+                                         resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8))
+
+# Determine the best resolution for tSNE clusters
+# Within the "integrated_snn_res.0.X" change out X = to the different resolutions and determine the best resolution by looking at the resulting tSNE plot clusters
+Idents(object = subset_seurat_integrated) <- "integrated_snn_res.0.3"
+DimPlot(subset_seurat_integrated,
+                 reduction = "tsne",
+                 label = TRUE,
+                 split.by = "sample",
+                 label.size = 6) + NoLegend()
+# 10 sub-clusters of astrocytes
+
+
+# rename
+subset_seurat_clustered <- subset_seurat_integrated
+
+# final tSNE plots
+# should match the UMAP with the chosen resolution above)
+p<-DimPlot(subset_seurat_clustered, 
+              reduction = "tsne", repel = T, label.box = T, pt.size = .8)
+# final clustered UMAP grouped by sample (able to observe overlap to suggest good integration)
+p2<-DimPlot(subset_seurat_clustered, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+# final clustered UMAP split by sample
+p3<-DimPlot(subset_seurat_clustered, reduction = "tsne", split.by = "sample", pt.size = .8)
+
+pdf("tsne.astros.subcluster.pdf")
+LabelClusters(plot=p, id= "ident", repel = T) + NoLegend()
+dev.off()
+
+pdf("tsne.astros.subcluster.tx.pdf")
+p2
+dev.off()
+
+pdf("tsne.astros.subcluster.tx.2.pdf")
+LabelClusters(plot=p3, id= "ident", repel = T) + NoLegend()
+dev.off()
+```
+
+```{r}
+# save the integrated, clustered version
+save(subset_seurat_integrated, file = paste0(resDir, "astro_seurat_integrated.RData"))
+
+# Cleanup
+rm(c = p, p2, p3, astro_seurat, seurat_integrated_tsne, subset_seurat_integrated)
+
+```
+
+Check out the number of cells per cluster and distribution by treatment
+
+```{r}
+#Load the data, if necessary
+load(paste0(resDir, "astro_seurat_integrated.RData"))
+
+# Extract and save the number of cells per cluster
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(subset_seurat_clustered, 
+                     vars = c("ident", "sample")) %>%
+  dplyr::count(ident, sample) %>%
+  tidyr::spread(ident, n)
+# View table
+View(n_cells)
+# Save the number of cells per cluster as a .xls file
+write.csv(n_cells, file = paste0(resDir, "nCells_astros.xls"))
+
+# Frequency plots
+
+pt <- table(Idents(subset_seurat_clustered), subset_seurat_clustered$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+pt
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+
+display.brewer.all()
+
+pdf("astro_cluster_freq_tx.pdf")
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = rev(brewer.pal(11, "Spectral"))) +
+  theme(legend.title = element_blank())
+dev.off()
+
+# It looks like there is a loss of the smaller clusters in the cKO, and an expansion of the larger, more homeostatic clusters.
+
+```
+
+Cluster defining features
+
+```{r}
+
+# use RNA data to assess gene expression contributing to clustering
+DefaultAssay(subset_seurat_clustered) <- "RNA"
+
+# FindMarkers between clusters directly
+subset_seurat_clustered = JoinLayers(subset_seurat_clustered)
+cluster.markers <- FindMarkers(subset_seurat_clustered,
+                               ident.1 = c(0),
+                               ident.2 = c(1),
+                               only.pos = F,
+                               logfc.threshold = 0.1)
+
+# Converts rownames to 1st column with the column name as "Gene"
+cluster.markers <- tibble::rownames_to_column(cluster.markers, "Gene")
+view(cluster.markers)
+
+
+# Find all sig markers for each cluster compared to all other clusters. 
+All_Sig_Markers <- FindAllMarkers(
+  subset_seurat_clustered, 
+  only.pos = T, 
+  logfc.threshold = 0.25, 
+  assay = "RNA")
+view(All_Sig_Markers)
+save(All_Sig_Markers, file = paste0(resDir,"astro_sig_cluster_markers.Rdata"))
+write.xlsx(All_Sig_Markers, file = paste0(resDir,"astro_sig_cluster_markers.xls"))
+
+# Prepare lists of significant markers
+Top_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = -p_val_adj)
+View(Top_Sig_Markers_List)
+save(Top_Sig_Markers_List, file = paste0(resDir,"astro_top_sig_cluster_markers.Rdata"))
+write.xlsx(Top_Sig_Markers_List, file = paste0(resDir,"astro_top_sig_cluster_markers.xls"))
+
+```
+
+Defining what these clusters are
+
+```{r}
+# curate top marker list
+Top10_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = -p_val_adj)
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = -p_val_adj)
+
+# For cluster 5, Mbp and Mobp are tied by p-value, so need to narrow it down by higher log2FC
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = -p_val_adj) %>%
+  top_n(n = 1, wt = avg_log2FC)
+
+# check out key markers in each of the clusters
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Gfap", "Aldh1l1", "S100b", "Apoe", "Aqp4", "Gria2", "Slc6a1","Aldoc"))
+
+# data viz from sanjita lab
+
+subset_seurat_clustered$groups <- sample(c("CreNeg", "CrePos"), size = ncol(subset_seurat_clustered), replace = TRUE)
+
+features <- c("Gfap", "Aldh1l1", "S100b", "Apoe", "Aqp4", "Gria2", "Slc6a1","Aldoc")
+
+RidgePlot(subset_seurat_clustered, features = features, ncol = 2)
+
+VlnPlot(subset_seurat_clustered, features = features)
+VlnPlot(subset_seurat_clustered, features = features, split.by = "groups")
+
+FeaturePlot(subset_seurat_clustered, features = features)
+
+DotPlot(subset_seurat_clustered, features = features) + RotatedAxis()
+
+FeaturePlot(subset_seurat_clustered, features = c("Casp1", "Pycard"), blend = TRUE)
+
+
+## using the top markers
+
+DotPlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene) + RotatedAxis()
+
+StackedVlnPlot(obj = subset_seurat_clustered, features = Top1_Sig_Markers_List$gene)
+
+
+pdf("astro_top_cluster_marker_dotplot_labels.pdf",width=8,height=5)
+DotPlot(subset_seurat_clustered, 
+        features = Top1_Sig_Markers_List$gene) + xlab(" ") + ylab("Astrocyte subcluster") + RotatedAxis()
+dev.off()
+
+pdf("astro_subcluster_topmarker_dotplot_tx.pdf")
+DotPlot(subset_seurat_clustered, 
+        features = Top1_Sig_Markers_List$gene,
+        split.by = "orig.ident") + RotatedAxis()
+dev.off()
+
+```
+
+Creating heatmaps
+
+```{r}
+
+# need to use integrated version (prior to setting the default assay to RNA)
+load(paste0(resDir, "astro_seurat_clustered.Rdata"))
+
+DoHeatmap(subset(subset_seurat_integrated, downsample = 100), features = features, size = 3)
+
+DoHeatmap(subset_seurat_integrated, 
+          features = features, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+# cluster-defining markers, top 10
+DoHeatmap(subset_seurat_integrated, 
+          features = Top_Sig_Markers_List$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+# cluster-defining markers, top 5
+Top5_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = -p_val_adj)
+
+pdf("astro_subcluster_top5marker_heatmap.pdf")
+DoHeatmap(subset_seurat_integrated, 
+          features = Top5_Sig_Markers_List$gene,  
+          cells = 1:500,
+          size = 4,
+          angle = 90) + NoLegend()
+dev.off()
+
+# cluster-defining markers, top 10
+Top10_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = -p_val_adj)
+
+pdf("astro_subcluster_top10marker_heatmap.pdf")
+DoHeatmap(subset_seurat_integrated, 
+          features = Top10_Sig_Markers_List$gene,  
+          cells = 1:500,
+          size = 4,
+          angle = 90) + NoLegend()
+dev.off()
+
+# top cluster-defining marker dotplots
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = -p_val_adj) %>%
+  top_n(n = 1, wt = avg_log2FC)
+
+VlnPlot(subset_seurat_clustered, 
+        features = Top1_Sig_Markers_List$gene, 
+        split.by = "groups")
+
+```
+
+```{r}
+#Cleanup
+rm(c= cluster.markers, DE_Markers.subset, DE_Markers, pt, n_cells)
+```
+
+Defining the astrocyte subgroups
+
+```{r}
+
+# classical
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Apoe", "Gfap", "Aqp4"))
+# upper cortical layer / liddelow cluster 1
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Mfge8", "Igfbp2"))
+# layer-specific / liddelow cluster 2
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Nnat", "Dbi", "Agt"))
+# gray matter / liddelow cluster 3
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Igfbp2","Nupr1", "Thrsp"))
+# white matter / inflammatory / liddelow cluster 4
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Vim", "Gfap" , "Lcn2", "Ifitm3" , "Timp1"))
+# SVZ / liddelow cluster 5
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Slc43a3", "Crym"))
+# white matter / synaptogenic / liddelow cluster 6
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Thbs4","Igfbp5", "Fxyd6","Cd9"))
+# synapse transmission / liddelow cluster 7
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Gria1","Gabrg3"))
+# SVZ / liddelow cluster 9
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Slc38a1", "Hopx", "Col1a2"))
+# phagocytic
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Mertk","Cd68"))
+# microglia
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Cx3cr1","P2ry12","Hexb"))
+# oligo
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Plp1","Mbp","Mobp"))
+# synaptic plasticity
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Agt","Ndrg4","Dbi","Slc7a10","Glul"))
+# synaptogenic
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Chrdl1","Lrtm2"))
+# ion transport
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Kcnj16","Kcnj10","Kcnk1"))
+# BBB
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Aqp4","Mfsd2a"))
+
+# renaming
+subset_seurat_clustered_labeled <- RenameIdents(subset_seurat_clustered, 
+                                         "0" = "Homeostatic1",
+                                         "1" = "Synaptogenic1",
+                                         "2" = "Homeostatic2",
+                                         "3" = "Synaptogenic2",
+                                         "4" = "Plasticity1",
+                                         "5" = "MyelinHi",
+                                         "6" = "DbiHi Cd9Neg",
+                                         "7" = "Plasticity2",
+                                         "8" = "SVZ",
+                                         "9" = "Inflammatory"
+)
+
+## new labeled tSNE plots
+pdf("astro_tSNE_labled.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                 reduction = "tsne",
+                  repel = T, 
+                label.box = T,
+                 label = TRUE,
+                 label.size = 6) + NoLegend()
+dev.off()
+
+pdf("astro_tSNE_labeled_tx.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                 reduction = "tsne",
+                 split.by = "sample",
+                 label.size = 6) 
+dev.off()
+
+
+save(subset_seurat_clustered_labeled, file = paste0(resDir, "subset_seurat_clustered_labeled.Rdata"))
+
+```
+
+Heatmap of top cluster markers with new labels
+
+```{r}
+# need to use the seurat file before the assay was changed to "RNA"
+load(paste0(resDir, "astro_seurat_integrated.Rdata"))
+
+# rename the clusters
+astro_seurat_integrated_labeled <- RenameIdents(subset_seurat_integrated, 
+                                         "0" = "Homeostatic1",
+                                         "1" = "Synaptogenic1",
+                                         "2" = "Homeostatic2",
+                                         "3" = "Synaptogenic2",
+                                         "4" = "Plasticity1",
+                                         "5" = "MyelinHi",
+                                         "6" = "DbiHi Cd9Neg",
+                                         "7" = "Plasticity2",
+                                         "8" = "SVZ",
+                                         "9" = "Inflammatory"
+)
+rm(subset_seurat_integrated)
+
+pdf("astro_subcluster_top5marker_heatmap.pdf", width=9, height=8.5)
+DoHeatmap(astro_seurat_integrated_labeled, 
+          features = Top5_Sig_Markers_List$gene,  
+          size = 4,
+          angle = 60) 
+dev.off()
+```
+
+
+
+Re-do cluster frequency plotting with the correct labels
+
+```{r}
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(subset_seurat_clustered_labeled, 
+                     vars = c("ident", "sample")) %>%
+  dplyr::count(ident, sample) %>%
+  tidyr::spread(ident, n)
+
+# Save the number of cells per cluster as a .xls file
+write.xlsx(n_cells, file = paste0(resDir, "nCells_astros_labels.xls"))
+
+# Frequency plots
+
+pt <- table(Idents(subset_seurat_clustered_labeled), subset_seurat_clustered_labeled$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+
+display.brewer.all()
+
+pdf("astro_cluster_freq_tx_labels.pdf")
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = c(
+          "grey",
+          "lightblue",
+          "cadetblue",
+          "palevioletred",
+          "plum",
+          "mediumpurple",
+          "slateblue4",
+          "gray20",
+          "darkseagreen",
+          "seagreen")) +
+  theme(legend.title = element_blank())
+dev.off()
+
+# tSNE with this same color scheme
+pdf("astro_tsne_labels_colors.pdf")
+DimPlot(object = subset_seurat_clustered_labeled, 
+        reduction = "tsne", 
+        label = TRUE, 
+        repel = T, 
+        label.box = T, 
+        pt.size = .8, 
+        cols = c(
+          "lightblue",
+          "darkseagreen",
+          "cadetblue",
+          "seagreen",
+          "mediumpurple",
+          "plum",
+          "grey",
+          "slateblue4",
+          "gray20",
+          "palevioletred"))+ NoLegend()
+dev.off()
+
+
+pdf("astro_tsne_labels_colors.tx.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                reduction = "tsne",
+                split.by = "sample",
+                label.size = 6,
+                pt.size = .8, 
+                cols = c(
+          "lightblue",
+          "darkseagreen",
+          "cadetblue",
+          "seagreen",
+          "mediumpurple",
+          "plum",
+          "grey",
+          "slateblue4",
+          "gray20",
+          "palevioletred"))
+dev.off()
+
+```
+
+
+```{r}
+#cleanup
+
+rm(All_Sig_Markers,astro_seurat,astro_seurat_integrated_labeled,n_cells,pt,subset_seurat_clustered_labeled,Top_Sig_Markers_List,Top1_Sig_Markers_List,Top10_Sig_Markers_List,Top5_Sig_Markers_List,features)
+
+```
+
+
+
+
+
+# Neurons
+
+
+```{r}
+
+# load in data
+# processed, clustered data with labeled cell populations
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+# set directory
+setwd(paste0(resDir, "/Subclustering"))
+
+DimPlot(seurat_clustered_labeled, reduction = "tsne") 
+
+# Create tSNE highlighting only the Neuron cluster (make all other clusters grey)
+pdf("tSNE_neuron_cluster_highlight.pdf")
+DimPlot(object = seurat_clustered_labeled, 
+        reduction = "tsne", label = TRUE, 
+        repel = T, label.box = T, pt.size = .8, cols = c(
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "slateblue1",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "slateblue1",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75"))+ NoLegend()
+dev.off()
+
+# Subset to keep only the neuron cluster
+neuron_seurat <- subset(seurat_clustered_labeled,
+                        idents = c(
+                          "Neurons",
+                          "Immature Neurons"),
+                        invert = FALSE) 
+
+# check new subsetted seurat
+DimPlot(object = neuron_seurat, reduction = "tsne")
+
+#### Save the Neuron subsetted Seurat
+save(neuron_seurat, file = paste0(resDir, "neuron_seurat.Rdata"))
+
+```
+
+
+# Analyzing the neuron subcluster
+
+```{r}
+# Create specific directory for this output
+setwd(resDir)
+dir.create("Neurons")
+setwd(paste0(resDir, "Neurons/"))
+
+#### Load labeled clustered Seurat of interest
+load(paste0(resDir, "neuron_seurat.Rdata"))
+
+## Cleanup the data
+subset_seurat <- neuron_seurat
+DefaultAssay(subset_seurat) <- "RNA"
+subset_seurat <- DietSeurat(subset_seurat, assays = "RNA")
+subset_seurat@meta.data[["integrated_snn_res.0.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.2"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.6"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.8"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.4"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.8"]] <- NULL
+subset_seurat@meta.data[["seurat_clusters"]] <- NULL
+```
+
+Redo SCTransform
+
+```{r}
+#This method is based off https://github.com/satijalab/seurat/issues/1883. 
+
+##### Re-SCTransform
+
+# split seurat object by sample
+subset.sct.list <-SplitObject(subset_seurat, split.by = "sample")
+# normalize and identify variable features for each seurat object independently
+subset.sct.list <- lapply(X = subset.sct.list, FUN = SCTransform)
+# select features that are repeatedly variable across seurat objects for integration
+subset.sct.features <- SelectIntegrationFeatures(object.list = subset.sct.list, nfeatures = 3000)
+# pep for integration steps
+subset.sct.list <- PrepSCTIntegration(object.list = subset.sct.list, anchor.features = subset.sct.features)
+# identifies anchors for integration - takes a long time!
+subset.sct.anchors <- FindIntegrationAnchors(object.list = subset.sct.list, 
+                                             normalization.method = "SCT", 
+                                             anchor.features = subset.sct.features)
+# perform integration
+sct_subset_seurat <- IntegrateData(anchorset = subset.sct.anchors, normalization.method = "SCT")
+
+# Remove SCTransform prep objects from the environment
+rm(subset_seurat)
+rm(subset.sct.anchors)
+rm(subset.sct.list)
+rm(subset.sct.features)
+```
+
+Re-PCA and tSNE
+
+```{r}
+# Rename seurat
+subset_seurat_integrated <- sct_subset_seurat
+# remove unused data from environment
+rm(sct_subset_seurat)
+
+# use integrated data to assess dimensionality and resolution
+DefaultAssay(subset_seurat_integrated) <- "integrated"
+### PCA
+# Run PCA
+subset_seurat_integrated <- RunPCA(object = subset_seurat_integrated, verbose = FALSE)
+### Check dimensionality
+ElbowPlot(subset_seurat_integrated, ndims = 50)
+
+## Re-tSNE
+seurat_integrated_tsne <- RunTSNE(subset_seurat_integrated, dims = 1:50)
+DimPlot(object = seurat_integrated_tsne, 
+        reduction = "tsne", 
+        label = TRUE) + NoLegend()
+
+
+### Clustering
+
+# Determine the K-nearest neighbor graph
+subset_seurat_integrated <- FindNeighbors(object = seurat_integrated_tsne, dims = 1:50, verbose = FALSE)
+# Determine the clusters for various resolutions                                
+subset_seurat_integrated <- FindClusters(object = subset_seurat_integrated,
+                                         resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8))
+
+# Determine the best resolution for tSNE clusters
+# Within the "integrated_snn_res.0.X" change out X = to the different resolutions and determine the best resolution by looking at the resulting tSNE plot clusters
+Idents(object = subset_seurat_integrated) <- "integrated_snn_res.0.6"
+DimPlot(subset_seurat_integrated,
+                 reduction = "tsne",
+                 label = TRUE,
+                 split.by = "sample",
+                 label.size = 6) + NoLegend()
+# 11 sub-clusters of neurons
+
+# save, and rename
+save(subset_seurat_integrated, file = paste0(resDir, "neuron_seurat_integrated.Rdata"))
+subset_seurat_clustered <- subset_seurat_integrated
+
+# final tSNE plots
+# should match the UMAP with the chosen resolution above)
+p<-DimPlot(subset_seurat_clustered, 
+              reduction = "tsne", repel = T, label.box = T, pt.size = .8)
+# final clustered UMAP grouped by sample (able to observe overlap to suggest good integration)
+p2<-DimPlot(subset_seurat_clustered, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+# final clustered UMAP split by sample
+p3<-DimPlot(subset_seurat_clustered, reduction = "tsne", split.by = "sample", pt.size = .8)
+
+pdf("tsne.neuron.subcluster.pdf")
+LabelClusters(plot=p, id= "ident", repel = T) + NoLegend()
+dev.off()
+
+pdf("tsne.neuron.subcluster.tx.pdf")
+p2
+dev.off()
+
+pdf("tsne.neuron.subcluster.tx.2.pdf")
+LabelClusters(plot=p3, id= "ident", repel = T) + NoLegend()
+dev.off()
+```
+
+```{r}
+# Cleanup
+rm(c = p, p2, p3, neuron_seurat, seurat_integrated_tsne, subset_seurat_integrated)
+```
+
+Check out the number of cells per cluster and distribution by treatment
+
+```{r}
+#Load the data, if necessary
+load(paste0(resDir, "neuron_seurat_integrated.RData"))
+
+# Extract and save the number of cells per cluster
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(subset_seurat_clustered, 
+                     vars = c("ident", "sample")) %>%
+  dplyr::count(ident, sample) %>%
+  tidyr::spread(ident, n)
+# View table
+View(n_cells)
+# Save the number of cells per cluster as a .xls file
+write.xslx(n_cells, file = paste0(resDir, "nCells_neurons.xls"))
+
+# Frequency plots
+
+pt <- table(Idents(subset_seurat_clustered), subset_seurat_clustered$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+pt
+
+pdf("neuron_cluster_freq_tx.pdf")
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+dev.off()
+
+display.brewer.all()
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = rev(brewer.pal(12, "Set3"))) +
+  theme(legend.title = element_blank())
+dev.off()
+
+```
+
+Cluster defining features
+```{r}
+# use RNA data to assess gene expression contributing to clustering
+DefaultAssay(subset_seurat_clustered) <- "RNA"
+
+# Find all sig markers for each cluster compared to all other clusters
+subset_seurat_clustered = JoinLayers(subset_seurat_clustered)
+All_Sig_Markers <- FindAllMarkers(
+  subset_seurat_clustered, only.pos = T, logfc.threshold = 0.25, assay = "RNA")
+view(All_Sig_Markers)
+write.xslx(All_Sig_Markers, file = paste0(resDir, "neuron_sig_cluster_markers.xls"))
+save(All_Sig_Markers, file = paste0(resDir, "neuron_sig_cluster_markers.RData"))
+
+# Prepare lists of significant markers
+Top_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+View(Top_Sig_Markers_List)
+write.xlsx(Top_Sig_Markers_List, file = paste0(resDir, "neuron_top_sig_cluster_markers.xls"))
+save(Top_Sig_Markers_List, file = paste0(resDir, "neuron_top_sig_cluster_markers.RData"))
+
+```
+
+Defining what these clusters are
+```{r}
+# check out key markers in each of the clusters
+
+# top cluster-defining marker dotplots
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = avg_log2FC)
+
+StackedVlnPlot(obj = subset_seurat_clustered, features = Top1_Sig_Markers_List$gene)
+
+# data viz from sanjita lab
+
+subset_seurat_clustered$groups <- sample(c("CreNeg", "CrePos"), size = ncol(subset_seurat_clustered), replace = TRUE)
+
+RidgePlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene, ncol = 2)
+
+VlnPlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene)
+VlnPlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene, split.by = "groups")
+
+FeaturePlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene)
+
+DotPlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene) + RotatedAxis()
+
+FeaturePlot(subset_seurat_clustered, features = c("Casp1", "Pycard"), blend = TRUE)
+```
+
+Heatmaps
+```{r}
+
+# need to use integrated version (prior to setting the default assay to RNA)
+load(paste0(resDir, "neuron_seurat_integrated.Rdata"))
+
+DoHeatmap(subset(subset_seurat_integrated, downsample = 100), features = Top1_Sig_Markers_List$gene, size = 3)
+
+DoHeatmap(subset_seurat_integrated, 
+          features = Top1_Sig_Markers_List$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+# cluster-defining markers, top 10
+DoHeatmap(subset_seurat_integrated, 
+          features = Top_Sig_Markers_List$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+# cluster-defining markers, top 5
+Top5_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+pdf("neuron_subcluster_top5marker_heatmap.pdf")
+DoHeatmap(subset_seurat_integrated, 
+          features = Top5_Sig_Markers_List$gene,  
+          cells = 1:500,
+          size = 4,
+          angle = 90) + NoLegend()
+dev.off()
+
+# top cluster-defining marker dotplots
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = avg_log2FC)
+
+VlnPlot(subset_seurat_clustered, 
+        features = Top1_Sig_Markers_List$gene, 
+        split.by = "groups")
+
+pdf("neuron_subcluster_topmarker_dotplot.pdf")
+DotPlot(subset_seurat_clustered, features = Top1_Sig_Markers_List$gene) + RotatedAxis()
+dev.off()
+
+pdf("neuron_subcluster_topmarker_dotplot_tx.pdf")
+DotPlot(subset_seurat_clustered, 
+        features = Top1_Sig_Markers_List$gene,
+        split.by = "orig.ident") + RotatedAxis()
+dev.off()
+```
+
+```{r}
+#Cleanup
+rm(c= cluster.markers, DE_Markers.subset, DE_Markers, pt, n_cells, All_Sig_Markers, subset_seurat_clustered, subset_seurat_integrated, Top_Sig_Markers_List, Top1_Sig_Markers_List, Top5_Sig_Markers_List)
+```
+
+
+
+
+
+# Microglia
+
+```{r}
+
+# load in data - processed, clustered data with labeled cell populations
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+# set directory
+setwd(paste0(resDir, "/Subclustering"))
+
+DimPlot(seurat_clustered_labeled, reduction = "tsne") 
+
+# Create tSNE highlighting only the Microglia cluster (make all other clusters grey)
+pdf("tSNE_microglia_cluster_highlight.pdf")
+DimPlot(object = seurat_clustered_labeled, 
+        reduction = "tsne", label = TRUE, 
+        repel = T, label.box = T, pt.size = .8, cols = c(
+          "grey75",
+          "plum4",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75",
+          "grey75"))+ NoLegend()
+dev.off()
+
+# Subset to keep only the microglia cluster
+mg_seurat <- subset(seurat_clustered_labeled,
+                        idents = c(
+                          "Microglia"),
+                        invert = FALSE) 
+
+# check new subsetted seurat
+DimPlot(object = mg_seurat, reduction = "tsne")
+
+#### Save the microglia subsetted Seurat
+save(mg_seurat, file = paste0(resDir, "mg_seurat.Rdata"))
+```
+
+
+```{r}
+# Create specific directory for this output
+setwd(resDir)
+dir.create("Microglia")
+setwd(paste0(resDir, "Microglia/"))
+
+#### Load labeled clustered Seurat of interest
+load(paste0(resDir, "mg_seurat.Rdata"))
+
+## Cleanup the data
+subset_seurat <- mg_seurat
+DefaultAssay(subset_seurat) <- "RNA"
+subset_seurat <- DietSeurat(subset_seurat, assays = "RNA")
+subset_seurat@meta.data[["integrated_snn_res.0.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.2"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.6"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.8"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.4"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.8"]] <- NULL
+subset_seurat@meta.data[["seurat_clusters"]] <- NULL
+```
+
+Redo SCTransform
+```{r}
+#This method is based off https://github.com/satijalab/seurat/issues/1883. 
+
+##### Re-SCTransform
+
+# split seurat object by sample
+subset.sct.list <-SplitObject(subset_seurat, split.by = "sample")
+# normalize and identify variable features for each seurat object independently
+subset.sct.list <- lapply(X = subset.sct.list, FUN = SCTransform)
+# select features that are repeatedly variable across seurat objects for integration
+subset.sct.features <- SelectIntegrationFeatures(object.list = subset.sct.list, nfeatures = 3000)
+# pep for integration steps
+subset.sct.list <- PrepSCTIntegration(object.list = subset.sct.list, anchor.features = subset.sct.features)
+# identifies anchors for integration - takes a long time!
+subset.sct.anchors <- FindIntegrationAnchors(object.list = subset.sct.list, 
+                                             normalization.method = "SCT", 
+                                             anchor.features = subset.sct.features)
+# perform integration
+sct_subset_seurat <- IntegrateData(anchorset = subset.sct.anchors, normalization.method = "SCT")
+
+# Remove SCTransform prep objects from the environment
+rm(subset_seurat)
+rm(subset.sct.anchors)
+rm(subset.sct.list)
+rm(subset.sct.features)
+```
+
+Re-PCA and tSNE
+```{r}
+# Rename seurat
+subset_seurat_integrated <- sct_subset_seurat
+# remove unused data from environment
+rm(sct_subset_seurat)
+
+# use integrated data to assess dimensionality and resolution
+DefaultAssay(subset_seurat_integrated) <- "integrated"
+### PCA
+# Run PCA
+subset_seurat_integrated <- RunPCA(object = subset_seurat_integrated, verbose = FALSE)
+### Check dimensionality
+ElbowPlot(subset_seurat_integrated, ndims = 50)
+
+## Re-tSNE
+seurat_integrated_tsne <- RunTSNE(subset_seurat_integrated, dims = 1:50)
+DimPlot(object = seurat_integrated_tsne, 
+        reduction = "tsne", 
+        label = TRUE) + NoLegend()
+
+
+### Clustering
+
+# Determine the K-nearest neighbor graph
+subset_seurat_integrated <- FindNeighbors(object = seurat_integrated_tsne, dims = 1:50, verbose = FALSE)
+# Determine the clusters for various resolutions                                
+subset_seurat_integrated <- FindClusters(object = subset_seurat_integrated,
+                                         resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8))
+
+# Determine the best resolution for tSNE clusters
+# Within the "integrated_snn_res.0.X" change out X = to the different resolutions and determine the best resolution by looking at the resulting tSNE plot clusters
+Idents(object = subset_seurat_integrated) <- "integrated_snn_res.0.1"
+DimPlot(subset_seurat_integrated,
+                 reduction = "tsne",
+                 label = TRUE,
+                 split.by = "sample",
+                 label.size = 6) + NoLegend()
+# 4 sub-clusters of microglia
+
+# save, and rename
+save(subset_seurat_integrated, file = paste0(resDir, "mg_seurat_integrated.Rdata"))
+subset_seurat_clustered <- subset_seurat_integrated
+
+# final tSNE plots
+# should match the UMAP with the chosen resolution above)
+p<-DimPlot(subset_seurat_clustered, 
+              reduction = "tsne", repel = T, label.box = T, pt.size = .8)
+# final clustered UMAP grouped by sample (able to observe overlap to suggest good integration)
+p2<-DimPlot(subset_seurat_clustered, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+# final clustered UMAP split by sample
+p3<-DimPlot(subset_seurat_clustered, reduction = "tsne", split.by = "sample", pt.size = .8)
+
+pdf("tsne.mg.subcluster.pdf")
+LabelClusters(plot=p, id= "ident", repel = T) + NoLegend()
+dev.off()
+
+pdf("tsne.mg.subcluster.tx.pdf")
+p2
+dev.off()
+
+pdf("tsne.mg.subcluster.tx.2.pdf")
+LabelClusters(plot=p3, id= "ident", repel = T) + NoLegend()
+dev.off()
+```
+
+```{r}
+# Save the new seurat objects
+save(subset_seurat_clustered, file = paste0(resDir, "mg_seurat_clustered.Rdata"))
+
+# Cleanup
+rm(c = p, p2, p3, mg_seurat, seurat_integrated_tsne)
+```
+
+Check out the number of cells per cluster and distribution by treatment
+
+```{r}
+#Load the data, if necessary
+load(paste0(resDir, "mg_seurat_clustered.Rdata"))
+
+# Extract and save the number of cells per cluster
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(subset_seurat_clustered, 
+                     vars = c("ident", "sample")) %>%
+  dplyr::count(ident, sample) %>%
+  tidyr::spread(ident, n)
+# View table
+View(n_cells)
+# Save the number of cells per cluster as a .xls file
+write.xlsx(n_cells, file = paste0(resDir, "nCells_mg.xls"))
+
+# Frequency plots
+
+pt <- table(Idents(subset_seurat_clustered), subset_seurat_clustered$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+pt
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+
+display.brewer.all()
+
+pdf("mg_cluster_freq_tx.pdf")
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = rev(brewer.pal(4, "Paired"))) +
+  theme(legend.title = element_blank())
+dev.off()
+
+# perhaps an expansion of cluster 1 in the cKO
+
+```
+
+Cluster defining features
+```{r}
+# use RNA data to assess gene expression contributing to clustering
+DefaultAssay(subset_seurat_clustered) <- "RNA"
+
+# Find all sig markers for each cluster compared to all other clusters. 
+subset_seurat_clustered = JoinLayers(subset_seurat_clustered)
+All_Sig_Markers <- FindAllMarkers(
+  subset_seurat_clustered, only.pos = T, logfc.threshold = 0.25, assay = "RNA")
+view(All_Sig_Markers)
+write.xlsx(All_Sig_Markers, file = paste0(resDir, "mg_all_sig_cluster_markers.xls"))
+save(All_Sig_Markers, file = paste0(resDir, "mg_all_sig_cluster_markers.Rdata"))
+
+# Prepare lists of significant markers
+Top10_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = -p_val_adj)%>%
+  top_n(n = 10, wt = avg_log2FC)
+View(Top10_Sig_Markers_List)
+write.xlsx(Top10_Sig_Markers_List, file = paste0(resDir, "mg_top_sig_cluster_markers.xls"))
+save(Top10_Sig_Markers_List, file = paste0(resDir, "mg_top_sig_cluster_markers.Rdata"))
+
+```
+
+Defining what these clusters are
+```{r}
+# check out key markers in each of the clusters
+View(Top10_Sig_Markers_List)
+
+# defining the microglia subgroups
+
+# Homeostatic
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Cx3cr1","Hexb","P2ry12","Tmem119"))
+# DAM
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Syk","Trem2","Cd68","Spp1"))
+# BAM
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Mrc1", "Pf4", "Apoe", "Ms4a7", "F13a1"))
+# Cluster 1
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Apoe","Pla2g7","Slc4a4","Cxcl14","Sox9","Gria2","Cldn10","Nrxn1"))
+# Cluster 2
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Top2a","Cdca8","Ccnb2","Nusap1","Cep55","Bub1"))
+# Cluster 3
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("C1ql1","Lhfpl3","Cspg4","Lhfpl3","Pdgfra"))
+
+# Top 5 genes by significance and log2FC
+Top5_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = -p_val_adj) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+# Top 1 gene by significance and log2FC
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = -p_val_adj) %>%
+  top_n(n = 1, wt = avg_log2FC)
+
+# renaming
+subset_seurat_clustered_labeled <- RenameIdents(subset_seurat_clustered, 
+                                         "0" = "Homeostatic",
+                                         "1" = "NPC-like",
+                                         "2" = "MG2",
+                                         "3" = "MG3"
+)
+
+## new labeled tSNE plots
+pdf("mg_tSNE_labled.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                 reduction = "tsne",
+                 label = TRUE,
+                 label.size = 6) + NoLegend()
+dev.off()
+
+pdf("mg_tSNE_labeled_tx.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                 reduction = "tsne",
+                 split.by = "sample",
+                 label.size = 6) 
+dev.off()
+
+
+save(subset_seurat_clustered_labeled, file = paste0(resDir, "subset_seurat_clustered_labeled.Rdata"))
+
+```
+
+Heatmaps
+```{r}
+
+# need to use integrated version (prior to setting the default assay to RNA)
+load(paste0(resDir, "mg_seurat_integrated.Rdata"))
+
+DoHeatmap(subset(subset_seurat_integrated, downsample = 100), features = Top1_Sig_Markers_List$gene, size = 3)
+
+DoHeatmap(subset_seurat_integrated, 
+          features = Top10_Sig_Markers_List$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+# cluster-defining markers, top 10
+DoHeatmap(subset_seurat_integrated, 
+          features = All_Sig_Markers$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+
+# Top 20 genes by significance and log2FC
+Top20_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 20, wt = -p_val_adj) %>%
+  top_n(n = 20, wt = avg_log2FC)
+
+
+pdf("mg_subcluster_top20marker_heatmap.pdf")
+DoHeatmap(subset_seurat_integrated, 
+          features = Top20_Sig_Markers_List$gene,  
+          cells = 1:500,
+          size = 4,
+          angle = 90) + NoLegend()
+dev.off()
+
+```
+
+Re-do cluster frequency plotting with the correct labels
+```{r}
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(subset_seurat_clustered_labeled, 
+                     vars = c("ident", "sample")) %>%
+  dplyr::count(ident, sample) %>%
+  tidyr::spread(ident, n)
+
+# Save the number of cells per cluster as a .xls file
+write.xlsx(n_cells, file = paste0(resDir, "nCells_mg_labels.xls"))
+
+# Frequency plots
+
+pt <- table(Idents(subset_seurat_clustered_labeled), subset_seurat_clustered_labeled$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+
+pdf("mg_cluster_freq_tx_labels.pdf")
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = c(
+          "grey60",
+          "lightslateblue",
+          "plum3",
+          "aquamarine3")) +
+  theme(legend.title = element_blank())
+dev.off()
+
+# tSNE with this same color scheme
+pdf("mg_tsne_labels_colors.pdf")
+DimPlot(object = subset_seurat_clustered_labeled, 
+        reduction = "tsne", 
+        label = TRUE, 
+        repel = T, 
+        label.box = T, 
+        pt.size = .8, 
+        cols = c(
+          "grey60",
+          "aquamarine3",
+          "lightslateblue",
+          "plum3"))+ NoLegend()
+dev.off()
+
+pdf("mg_tsne_labels_colors.tx.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                reduction = "tsne",
+                split.by = "sample",
+                label.size = 6,
+                pt.size = .8, 
+                cols = c(
+                "grey60",
+                "aquamarine3",
+                "lightslateblue",
+                "plum3"))
+dev.off()
+
+```
+
+
+```{r}
+#Cleanup
+rm(c= cluster.markers, DE_Markers.subset, DE_Markers, pt, n_cells, All_Sig_Markers, subset_seurat_clustered, subset_seurat_clustered_labeled, subset_seurat_integrated, Top1_Sig_Markers_List, Top5_Sig_Markers_List, Top10_Sig_Markers_List, Top20_Sig_Markers_List)
+```
+
+
+
+# Oligos
+
+
+```{r}
+
+# load in data - processed, clustered data with labeled cell populations
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+# set directory
+setwd(paste0(resDir, "/Subclustering"))
+
+
+# Create tSNE highlighting only the oligo cluster (make all other clusters grey)
+pdf("tSNE_oligo_cluster_highlight.pdf")
+DimPlot(object = seurat_clustered_labeled, 
+                     reduction = "tsne", label = TRUE, 
+        repel = T, label.box = T, pt.size = .8, cols = c(
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "seagreen",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "seagreen",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75",
+                       "grey75"))+ NoLegend()
+dev.off() 
+
+# Subset to keep only the astrocyte cluster
+oligo_seurat <- subset(seurat_clustered_labeled,
+                    idents = c("Oligodendrocytes","OPCs"),
+                    invert = FALSE) # invert FALSE here will keep only the selected cluster
+
+# check new subsetted seurat
+DimPlot(object = oligo_seurat, reduction = "tsne")
+
+#### Save and cleanup
+save(oligo_seurat, file = paste0(resDir, "oligo_seurat.Rdata"))
+rm(seurat_clustered_labeled)
+```
+
+
+
+```{r}
+# Create specific directory for this output
+setwd(resDir)
+dir.create("Oligos")
+setwd(paste0(resDir, "Oligos/"))
+
+#### Load labeled clustered Seurat of interest
+load(paste0(resDir, "oligo_seurat.Rdata"))
+
+## Cleanup the data
+subset_seurat <- oligo_seurat
+DefaultAssay(subset_seurat) <- "RNA"
+subset_seurat <- DietSeurat(subset_seurat, assays = "RNA")
+subset_seurat@meta.data[["integrated_snn_res.0.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.2"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.6"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.0.8"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.4"]] <- NULL
+subset_seurat@meta.data[["integrated_snn_res.1.8"]] <- NULL
+subset_seurat@meta.data[["seurat_clusters"]] <- NULL
+```
+
+Redo SCTransform
+```{r}
+#This method is based off https://github.com/satijalab/seurat/issues/1883. 
+
+##### Re-SCTransform
+
+# split seurat object by sample
+subset.sct.list <-SplitObject(subset_seurat, split.by = "sample")
+# normalize and identify variable features for each seurat object independently
+subset.sct.list <- lapply(X = subset.sct.list, FUN = SCTransform)
+# select features that are repeatedly variable across seurat objects for integration
+subset.sct.features <- SelectIntegrationFeatures(object.list = subset.sct.list, nfeatures = 3000)
+# pep for integration steps
+subset.sct.list <- PrepSCTIntegration(object.list = subset.sct.list, anchor.features = subset.sct.features)
+# identifies anchors for integration - takes a long time!
+subset.sct.anchors <- FindIntegrationAnchors(object.list = subset.sct.list, 
+                                             normalization.method = "SCT", 
+                                             anchor.features = subset.sct.features)
+# perform integration
+sct_subset_seurat <- IntegrateData(anchorset = subset.sct.anchors, normalization.method = "SCT")
+
+# Remove SCTransform prep objects from the environment
+rm(subset_seurat)
+rm(subset.sct.anchors)
+rm(subset.sct.list)
+rm(subset.sct.features)
+```
+
+Re-PCA and tSNE
+```{r}
+# Rename seurat
+subset_seurat_integrated <- sct_subset_seurat
+# remove unused data from environment
+rm(sct_subset_seurat)
+
+# use integrated data to assess dimensionality and resolution
+DefaultAssay(subset_seurat_integrated) <- "integrated"
+### PCA
+# Run PCA
+subset_seurat_integrated <- RunPCA(object = subset_seurat_integrated, verbose = FALSE)
+### Check dimensionality
+ElbowPlot(subset_seurat_integrated, ndims = 50)
+
+## Re-tSNE
+seurat_integrated_tsne <- RunTSNE(subset_seurat_integrated, dims = 1:50)
+DimPlot(object = seurat_integrated_tsne, 
+        reduction = "tsne", 
+        label = TRUE) + NoLegend()
+
+
+# Clustering
+
+# Determine the K-nearest neighbor graph
+subset_seurat_integrated <- FindNeighbors(object = seurat_integrated_tsne, dims = 1:50, verbose = FALSE)
+# Determine the clusters for various resolutions                                
+subset_seurat_integrated <- FindClusters(object = subset_seurat_integrated,
+                                         resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8))
+
+# Determine the best resolution for tSNE clusters
+# Within the "integrated_snn_res.0.X" change out X = to the different resolutions and determine the best resolution by looking at the resulting tSNE plot clusters
+Idents(object = subset_seurat_integrated) <- "integrated_snn_res.0.1"
+DimPlot(subset_seurat_integrated,
+                 reduction = "tsne",
+                 label = TRUE,
+                 split.by = "sample",
+                 label.size = 6) + NoLegend()
+# 5 sub-clusters of oligos
+
+# save, and rename
+save(subset_seurat_integrated, file = paste0(resDir, "oligo_seurat_integrated.Rdata"))
+subset_seurat_clustered <- subset_seurat_integrated
+
+# final tSNE plots
+# should match the UMAP with the chosen resolution above)
+p<-DimPlot(subset_seurat_clustered, 
+              reduction = "tsne", repel = T, label.box = T, pt.size = .8)
+# final clustered UMAP grouped by sample (able to observe overlap to suggest good integration)
+p2<-DimPlot(subset_seurat_clustered, 
+        reduction = "tsne", 
+        group.by = "sample",
+        cols = c("grey50", "seagreen2"),
+        alpha = 0.7) + ggtitle(NULL)
+# final clustered UMAP split by sample
+p3<-DimPlot(subset_seurat_clustered, reduction = "tsne", split.by = "sample", pt.size = .8)
+
+pdf("tsne.oligo.subcluster.pdf")
+LabelClusters(plot=p, id= "ident", repel = T) + NoLegend()
+dev.off()
+
+pdf("tsne.oligo.subcluster.tx.pdf")
+p2
+dev.off()
+
+pdf("tsne.oligo.subcluster.tx.2.pdf")
+LabelClusters(plot=p3, id= "ident", repel = T) + NoLegend()
+dev.off()
+```
+
+```{r}
+# Save the new seurat objects
+save(subset_seurat_clustered, file = paste0(resDir, "oligo_seurat_clustered.Rdata"))
+
+# Cleanup
+rm(c = p, p2, p3, oligo_seurat, seurat_integrated_tsne)
+```
+
+
+Find cluster markers
+```{r}
+# use RNA data to assess gene expression contributing to clustering
+DefaultAssay(subset_seurat_clustered) <- "RNA"
+
+# Find all sig markers for each cluster compared to all other clusters. 
+subset_seurat_clustered <- JoinLayers(subset_seurat_clustered)
+All_Sig_Markers <- FindAllMarkers(
+  subset_seurat_clustered, only.pos = T, logfc.threshold = 0.25, assay = "RNA")
+view(All_Sig_Markers)
+write.xlsx(All_Sig_Markers, file = paste0(resDir, "oligo_all_sig_cluster_markers.xls"))
+save(All_Sig_Markers, file = paste0(resDir, "oligo_all_sig_cluster_markers.Rdata"))
+
+# Prepare lists of significant markers
+Top10_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = -p_val_adj) %>%
+  top_n(n = 10, wt = avg_log2FC)
+View(Top10_Sig_Markers_List)
+write.xlsx(Top10_Sig_Markers_List, file = paste0(resDir, "oligo_top_sig_cluster_markers.xls"))
+save(Top10_Sig_Markers_List, file = paste0(resDir, "oligo_top_sig_cluster_markers.Rdata"))
+
+```
+
+Heatmaps
+```{r}
+
+# need to use integrated version (prior to setting the default assay to RNA)
+load(paste0(resDir, "oligo_seurat_integrated.Rdata"))
+
+# cluster-defining markers, top 10
+pdf("oligo_subcluster_top10marker_heatmap.pdf")
+DoHeatmap(subset_seurat_integrated, 
+          features = Top10_Sig_Markers_List$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+dev.off()
+
+# cluster-defining markers, top 5
+Top5_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = -p_val_adj) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+pdf("oligo_subcluster_top5marker_heatmap.pdf")
+DoHeatmap(subset_seurat_integrated, 
+          features = Top5_Sig_Markers_List$gene,  
+          cells = 1:500,
+          size = 4,
+          angle = 90) + NoLegend()
+dev.off()
+
+# top gene of weach cluster
+Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 1, wt = -p_val_adj) %>%
+  top_n(n = 1, wt = avg_log2FC)
+
+DoHeatmap(subset(subset_seurat_integrated, downsample = 100), features = Top1_Sig_Markers_List$gene, size = 3)
+
+DoHeatmap(subset_seurat_integrated, 
+          features = Top10_Sig_Markers_List$gene, 
+          cells = 1:500, 
+          size = 4,
+          angle = 90) + NoLegend()
+
+```
+
+
+Defining what these clusters are
+```{r}
+# check out key markers in each of the clusters
+View(Top10_Sig_Markers_List)
+
+Top20_Sig_Markers_List <- All_Sig_Markers %>%
+  group_by(cluster) %>%
+  top_n(n = 20, wt = -p_val_adj) %>%
+  top_n(n = 20, wt = avg_log2FC)
+View(Top20_Sig_Markers_List)
+
+#opc
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Pdgfra", "Sox10", "Olig1", "Olig2", "Cspg4"))
+#oligo
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Mal", "Ermn", "Mog", "Plp1", "Cadm4", "Dbi", "Mbp"))
+# cluster 3
+StackedVlnPlot(obj = subset_seurat_clustered, features = c("Thbs3","Cxcl12","Tmem141","Ctps"))
+
+
+# renaming
+subset_seurat_clustered_labeled <- RenameIdents(subset_seurat_clustered, 
+                                         "0" = "Homeostatic",
+                                         "1" = "Astrocyte-like",
+                                         "2" = "OPC",
+                                         "3" = "Homeostatic2",
+                                         "4" = "Microglia-like"
+)
+
+## new labeled tSNE plots
+pdf("oligo_tSNE_labled.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                 reduction = "tsne",
+                 label = TRUE,
+                 label.size = 6) + NoLegend()
+dev.off()
+
+pdf("oligo_tSNE_labeled_tx.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                 reduction = "tsne",
+                 split.by = "sample",
+                 label.size = 6) 
+dev.off()
+
+
+save(subset_seurat_clustered_labeled, file = paste0(resDir, "subset_seurat_clustered_labeled.Rdata"))
+
+```
+
+
+Cluster frequency plotting
+```{r}
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(subset_seurat_clustered_labeled, 
+                     vars = c("ident", "sample")) %>%
+  dplyr::count(ident, sample) %>%
+  tidyr::spread(ident, n)
+
+# Save the number of cells per cluster as a .xls file
+write.xlsx(n_cells, file = paste0(resDir, "nCells_oligo_labels.xls"))
+
+# Frequency plots
+
+pt <- table(Idents(subset_seurat_clustered_labeled), subset_seurat_clustered_labeled$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+
+pdf("oligo_cluster_freq_tx_labels.pdf")
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  scale_fill_manual(values = c(
+          "seagreen3",
+          "grey60",
+          "slategray2",
+          "plum4",
+          "steelblue")) +
+  theme(legend.title = element_blank())
+dev.off()
+
+# tSNE with this same color scheme
+pdf("oligo_tsne_labels_colors.pdf")
+DimPlot(object = subset_seurat_clustered_labeled, 
+        reduction = "tsne", 
+        label = TRUE, 
+        repel = T, 
+        label.box = T, 
+        pt.size = .8, 
+        cols = c(
+                  "grey60",
+                  "seagreen3",
+                  "steelblue",
+                  "slategray2",
+                  "plum4"))+ NoLegend()
+dev.off()
+
+pdf("oligo_tsne_labels_colors.tx.pdf")
+DimPlot(subset_seurat_clustered_labeled,
+                reduction = "tsne",
+                split.by = "sample",
+                label.size = 6,
+                pt.size = .8, 
+                cols = c(
+                  "grey60",
+                  "seagreen3",
+                  "steelblue",
+                  "slategray2",
+                  "plum4"
+                         ))
+dev.off()
+
+```
+
+```{r}
+#cleanup
+rm(pt,n_cells,All_Sig_Markers, subset_seurat_clustered, subset_seurat_clustered_labeled, subset_seurat_integrated, Top1_Sig_Markers_List, Top5_Sig_Markers_List, Top10_Sig_Markers_List, Top20_Sig_Markers_List)
+```
+
+
+
+
+
+```{r}
+sessionInfo()
+
+#R version 4.3.3 (2024-02-29)
+#Platform: aarch64-apple-darwin20 (64-bit)
+#Running under: macOS Sonoma 14.5
+
+#Matrix products: default
+#BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+#LAPACK: /Library/Frameworks/R.framework/Versions/4.3-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.11.0
+
+#locale:
+#[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+#time zone: America/New_York
+#tzcode source: internal
+
+#attached base packages:
+#[1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+#other attached packages:
+# [1] glmGamPoi_1.14.3            zinbwave_1.24.0             SingleCellExperiment_1.24.0
+# [4] openxlsx_4.2.5.2            sctransform_0.4.1           RColorBrewer_1.1-3         
+# [7] EnhancedVolcano_1.20.0      ggrepel_0.9.5               DESeq2_1.42.1              
+#[10] SummarizedExperiment_1.32.0 Biobase_2.62.0              MatrixGenerics_1.14.0      
+#[13] matrixStats_1.3.0           GenomicRanges_1.54.1        GenomeInfoDb_1.38.8        
+#[16] IRanges_2.36.0              S4Vectors_0.40.2            BiocGenerics_0.48.1        
+#[19] limma_3.58.1                metap_1.10                  clustree_0.5.1             
+#[22] ggraph_2.2.1                patchwork_1.2.0             magrittr_2.0.3             
+#[25] BiocManager_1.30.23         ggridges_0.5.6              RCurl_1.98-1.14            
+#[28] cowplot_1.1.3               scales_1.3.0                Matrix_1.6-5               
+#[31] lubridate_1.9.3             forcats_1.0.0               stringr_1.5.1              
+#[34] dplyr_1.1.4                 purrr_1.0.2                 readr_2.1.5                
+#[37] tidyr_1.3.1                 tibble_3.2.1                ggplot2_3.5.1              
+#[40] tidyverse_2.0.0             Seurat_5.1.0                SeuratObject_5.0.2         
+#[43] sp_2.1-4                   
+
+#loaded via a namespace (and not attached):
+#  [1] spatstat.sparse_3.1-0     bitops_1.0-7              httr_1.4.7               
+#  [4] numDeriv_2016.8-1.1       tools_4.3.3               utf8_1.2.4               
+#  [7] R6_2.5.1                  lazyeval_0.2.2            uwot_0.1.16              
+# [10] sn_2.1.1                  withr_3.0.0               gridExtra_2.3            
+# [13] progressr_0.14.0          cli_3.6.3                 spatstat.explore_3.2-7   
+# [16] fastDummies_1.7.3         sandwich_3.1-0            labeling_0.4.3           
+# [19] mvtnorm_1.2-5             spatstat.data_3.1-2       genefilter_1.84.0        
+# [22] pbapply_1.7-2             parallelly_1.37.1         plotrix_3.8-4            
+# [25] rstudioapi_0.16.0         RSQLite_2.3.7             generics_0.1.3           
+# [28] ica_1.0-3                 spatstat.random_3.2-3     zip_2.3.1                
+# [31] fansi_1.0.6               abind_1.4-5               lifecycle_1.0.4          
+# [34] multcomp_1.4-25           yaml_2.3.8                edgeR_4.0.16             
+# [37] mathjaxr_1.6-0            SparseArray_1.2.4         Rtsne_0.17               
+# [40] grid_4.3.3                blob_1.2.4                promises_1.3.0           
+# [43] crayon_1.5.3              miniUI_0.1.1.1            lattice_0.22-6           
+# [46] annotate_1.80.0           KEGGREST_1.42.0           pillar_1.9.0             
+# [49] knitr_1.47                future.apply_1.11.2       codetools_0.2-20         
+# [52] leiden_0.4.3.1            mutoss_0.1-13             glue_1.7.0               
+# [55] data.table_1.15.4         vctrs_0.6.5               png_0.1-8                
+# [58] spam_2.10-0               Rdpack_2.6                gtable_0.3.5             
+# [61] cachem_1.1.0              xfun_0.45                 rbibutils_2.2.16         
+# [64] S4Arrays_1.2.1            mime_0.12                 tidygraph_1.3.1          
+# [67] survival_3.7-0            statmod_1.5.0             fitdistrplus_1.1-11      
+# [70] TH.data_1.1-2             ROCR_1.0-11               nlme_3.1-165             
+# [73] bit64_4.0.5               RcppAnnoy_0.0.22          irlba_2.3.5.1            
+# [76] KernSmooth_2.23-24        colorspace_2.1-0          DBI_1.2.3                
+# [79] mnormt_2.1.1              tidyselect_1.2.1          bit_4.0.5                
+# [82] compiler_4.3.3            TFisher_0.2.0             DelayedArray_0.28.0      
+# [85] plotly_4.10.4             lmtest_0.9-40             digest_0.6.36            
+# [88] goftest_1.2-3             spatstat.utils_3.0-5      rmarkdown_2.27           
+# [91] XVector_0.42.0            htmltools_0.5.8.1         pkgconfig_2.0.3          
+# [94] sparseMatrixStats_1.14.0  fastmap_1.2.0             rlang_1.1.4              
+# [97] htmlwidgets_1.6.4         shiny_1.8.1.1             DelayedMatrixStats_1.24.0
+#[100] farver_2.1.2              zoo_1.8-12                jsonlite_1.8.8           
+#[103] BiocParallel_1.36.0       GenomeInfoDbData_1.2.11   dotCall64_1.1-1          
+#[106] munsell_0.5.1             Rcpp_1.0.12               viridis_0.6.5            
+#[109] reticulate_1.37.0         stringi_1.8.4             zlibbioc_1.48.2          
+#[112] MASS_7.3-60.0.1           plyr_1.8.9                parallel_4.3.3           
+#[115] listenv_0.9.1             deldir_2.0-4              Biostrings_2.70.3        
+#[118] graphlayouts_1.1.1        splines_4.3.3             tensor_1.5               
+#[121] multtest_2.58.0           hms_1.1.3                 locfit_1.5-9.10          
+#[124] qqconf_1.3.2              igraph_2.0.3              spatstat.geom_3.2-9      
+#[127] RcppHNSW_0.6.0            softImpute_1.4-1          reshape2_1.4.4           
+#[130] XML_3.99-0.17             evaluate_0.24.0           tzdb_0.4.0               
+#[133] tweenr_2.0.3              httpuv_1.6.15             RANN_2.6.1               
+#[136] polyclip_1.10-6           future_1.33.2             scattermore_1.2          
+#[139] ggforce_0.4.2             xtable_1.8-4              RSpectra_0.16-1          
+#[142] later_1.3.2               viridisLite_0.4.2         memoise_2.0.1            
+#[145] AnnotationDbi_1.64.1      cluster_2.1.6             timechange_0.3.0         
+#[148] globals_0.16.3  
+```
+

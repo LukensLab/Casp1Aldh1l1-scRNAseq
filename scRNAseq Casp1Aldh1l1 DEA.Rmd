@@ -1,0 +1,1483 @@
+---
+title: "scRNAseq Casp1Aldh1l1 Subclustering and DEA"
+author: "Kristine Zengeler"
+date: "2023-05-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Differential expression analysis using Zinbwave
+
+Better method for differential gene expression analysis to correct for many zeroes present in a dataset. 
+
+```{r}
+# Load packages
+library(zinbwave)
+library(DESeq2)
+library(scran)
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(openxlsx)
+library(EnhancedVolcano)
+```
+
+# Set working directory and import data
+
+```{r}
+# Create specific directory for this output
+resDir = "~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/"
+setwd(resDir)
+dir.create("DEA")
+setwd(paste0(resDir, "DEA/"))
+
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+
+```
+
+
+# Setup
+
+For all subclusters
+
+```{r}
+
+# rename and check genes
+data<-seurat_clustered_labeled
+rownames(data)
+rm(seurat_clustered_labeled)
+
+# save the raw counts as a matrix
+raw.data <- as.matrix(GetAssayData(data,slot = "counts"))
+raw.data[1:20,1:5]
+save(raw.data, file = "raw.counts.RData")
+counts<-raw.data
+rm(raw.data)
+
+# save the cluster IDs as a matrix
+cluster.id <- as.matrix(Idents(data))
+head(cluster.id)
+head(t(cluster.id))
+save(cluster.id, file = "cluster.ids.RData")
+clusters<-cluster.id
+rm(cluster.id,data)
+```
+
+```{r}
+categorize.deseq.df <- function(df, fdr = 0.05, log2fold = 0.0, treat
+= 'Auxin') {
+
+    df.effects.lattice = df
+    df.effects.lattice$response = 'X'
+
+    if(nrow(df.effects.lattice[df.effects.lattice$padj < fdr & !is.na(df.effects.lattice$padj) & df.effects.lattice$log2FoldChange > log2fold,]) > 0) {
+        df.effects.lattice[df.effects.lattice$padj < fdr & !is.na(df.effects.lattice$padj) & df.effects.lattice$log2FoldChange > log2fold,]$response = 'up'
+    }
+    if(nrow(df.effects.lattice[df.effects.lattice$padj < fdr & !is.na(df.effects.lattice$padj) & df.effects.lattice$log2FoldChange < log2fold,]) > 0) {
+        df.effects.lattice[df.effects.lattice$padj < fdr & !is.na(df.effects.lattice$padj) & df.effects.lattice$log2FoldChange < log2fold,]$response = 'down'
+    }
+     
+    return(df.effects.lattice)
+}
+```
+
+
+# Differential expression analysis using zinbwave
+
+First, starting with DEA conducted on all cells in the dataset
+
+```{r}
+
+# collect counts information with zeroes removed
+small.counts = counts[rowSums(counts) > 0,]
+dim(small.counts)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.allcells.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="allcells_zinbwave_genes.xls")
+saveRDS(res,file="allcells_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="allcells_zinbwave_sig_genes.xls")
+saveRDS(res.sig, file="allcells_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+pdf("allcells.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "salmon2"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-5, 5),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+
+select.degs<-c("Ttr","Lars2","Wfdc2","Kl","Folr1","Prlr","Jun","Slc4a5","Slc16a8","Kcne2","Otx2","Aqp1","Ace","Fosb","Junb","Cox8b","Kcnj13","Sox18","Fos","Vim","Cox20","Ezr","Mbp","Snap25","Fabp7","Hba-a2","Hba-a1","Mgl2","Npy","Nrgn")
+
+pdf("allcells.zinbwave.volcano.2.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`,
+                            selectLab = select.degs,
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "salmon2"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-5, 5),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+
+# cell type dot plots
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/seurat_clustered_labeled.Rdata")
+
+pdf("allcells.zinb.degs.cluster.dotplot.pdf")
+DotPlot(seurat_clustered_labeled, 
+        features = select.degs) + RotatedAxis()
+dev.off()
+
+ss.learning.neurogenesis<-c("Kpna1","Trim9","Agt","Iqsec1","Nrgn","Snap25","Gabra1","Npy","Ndrg1","Atp1a3","Mbp","Kif5a","Gstp1","Fabp7")
+
+pdf("allcells.zinb.learningdegs.cluster.dotplot.pdf")
+DotPlot(seurat_clustered_labeled, 
+        features = ss.learning.neurogenesis) + RotatedAxis()
+dev.off()
+
+actin.muscle<-c("Kcne2","Smim22","Aqp1","Ooep","Pdlim3","Acta2","Tpm2","Pln","Lmod1","Myl9","Tpm1","Bst2","Tpm4","Myl6","Dstn","Ezr","Swap70","Fxyd1","Sulf1","Mylk","Slmap")
+
+pdf("allcells.zinb.muscledegs.cluster.dotplot.pdf")
+DotPlot(seurat_clustered_labeled, 
+        features = actin.muscle) + RotatedAxis()
+dev.off()
+
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,mg,nControl,res.summary,dds,res,res.sig,zinb,select.degs,seurat_clustered_labeled,actin.muscle,ss.learning.neurogenesis)
+
+```
+
+
+# Astrocyte DEA 
+
+```{r}
+
+# collect cluster and counts information
+astros = clusters[clusters[,1] == "Astrocytes",]
+small.counts.astro = counts[,colnames(counts) %in% names(astros)]
+small.counts.astro = small.counts.astro[rowSums(small.counts.astro) > 0,]
+
+# filtering
+filter.astro <- rowSums(small.counts.astro >= 5) >= 5
+table(filter.astro)
+small.counts.astro <- small.counts.astro[filter.astro,]
+dim(small.counts.astro)
+
+# collect the number of cells per condition
+nControl.astro = length(grep('Control',colnames(small.counts.astro)))
+KOast.astro = length(grep('KOast',colnames(small.counts.astro)))
+
+# assemble the column data object needed for zinbwave
+colData.astro <- DataFrame(
+  Treatment=c(rep('Control',nControl.astro),
+              rep('KOast',KOast.astro)),
+  row.names=colnames(small.counts.astro))
+
+# create the summarized experiment object needed for zinbwave
+x.astro = SummarizedExperiment(
+  assays=list(counts=small.counts.astro), 
+  colData=colData.astro)
+
+# run zinbwave and save
+zinb.astro <- zinbwave(x.astro, K=0, epsilon=1000)
+save(zinb.astro,file='zinb.astro.Rdata')
+
+# prep for DEseq
+dds.astro <- DESeqDataSet(zinb.astro, design = ~ Treatment)
+dds.astro <- estimateSizeFactors(dds.astro, type="poscounts")
+
+# DEseq
+dds.astro <- DESeq(dds.astro, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds.astro)
+res.astro <- results(dds.astro, independentFiltering=FALSE)
+summary(res.astro)
+
+res<-as.data.frame(results(dds.astro))
+res$Gene<-rownames(res)
+write.xlsx(res,file="astro_zinbwave_genes.xls")
+save(res,file = "astro_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file = "astro_zinbwave_sig_genes.xls")
+save(res.sig,file="astro_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+astro.degs<-as.character(res.sig$`Gene`)
+
+pdf("astro.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = astro.degs,
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "seagreen3"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-3, 3),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+select.degs<-c("Prex2","Ramp1","Gpr37l1","Ptgds","Slc20a1","Sirpa","Cst3","Plp1","Jun","Sparcl1","Ifitm2","Marcks","Kcnk1","Mobp","Lars2","Lgalsl","Grin2c","Enpp2","Ttr","Mbp","Gm42418","Fabp7","Rpl35")
+
+pdf("astro.zinbwave.volcano.2.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = select.degs,
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "seagreen3"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+
+# subcluster dot plot
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/Astrocytes/subset_seurat_clustered_labeled.Rdata")
+astro.subclusters<-subset_seurat_clustered_labeled
+rm(subset_seurat_clustered_labeled)
+
+pdf("astro.zinb.degs.cluster.dotplot.pdf",width=17,height=4)
+DotPlot(astro.subclusters, 
+        features = astro.degs) + theme(axis.text.x = element_text(size = 10)) + xlab(" ") + ylab(" ") + RotatedAxis()
+dev.off()
+
+rm(colData.astro,dds.astro,res,res.astro,res.sig,small.counts.astro,x.astro,zinb.astro,filter.astro,KOast.astro,nControl.astro,astros,astro.subclusters,astro.degs,select.degs)
+```
+
+
+# Neuron DEA
+
+```{r}
+
+# collect cluster and counts information
+neuron = clusters[clusters[,1] == "Neurons",]
+small.counts.neuron = counts[,colnames(counts) %in% names(neuron)]
+small.counts.neuron = small.counts.neuron[rowSums(small.counts.neuron) > 0,]
+
+# filtering
+filter.neuron <- rowSums(small.counts.neuron >= 5) >= 5
+table(filter.neuron)
+small.counts.neuron <- small.counts.neuron[filter.neuron,]
+dim(small.counts.neuron)
+
+# collect the number of cells per condition
+nControl.neuron = length(grep('Control',colnames(small.counts.neuron)))
+KOast.neuron = length(grep('KOast',colnames(small.counts.neuron)))
+
+# assemble the column data object needed for zinbwave
+colData.neuron <- DataFrame(
+  Treatment=c(rep('Control',nControl.neuron),
+              rep('KOast',KOast.neuron)),
+  row.names=colnames(small.counts.neuron))
+
+# create the summarized experiment object needed for zinbwave
+x.neuron = SummarizedExperiment(
+  assays=list(counts=small.counts.neuron), 
+  colData=colData.neuron)
+
+# run zinbwave and save
+zinb.neuron<- zinbwave(x.neuron, K=0, epsilon=1000)
+save(zinb.neuron,file='zinb.neuron.Rdata')
+
+# prep for DEseq
+dds.neuron <- DESeqDataSet(zinb.neuron, design = ~ Treatment)
+dds.neuron <- estimateSizeFactors(dds.neuron, type="poscounts")
+
+# DEseq
+dds.neuron <- DESeq(dds.neuron, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds.neuron)
+res.neuron <- results(dds.neuron, independentFiltering=FALSE)
+summary(res.neuron)
+
+res<-as.data.frame(results(dds.neuron))
+res$Gene<-rownames(res)
+write.xlsx(res,file="neuron_zinbwave_genes.xls")
+save(res,file="neuron_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file = paste0(resDir, "neuron_zinbwave_sig_genes.xls"))
+save(res.sig, file="neuron_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+pdf("neuron.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "slateblue1"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+rm(colData.neuron,dds.neuron,res,res.neuron,res.sig,small.counts.neuron,x.neuron,zinb.neuron,filter.neuron,KOast.neuron,nControl.neuron,neuron)
+
+```
+
+
+
+# Microglia DEA
+
+```{r}
+
+# collect cluster and counts information
+mg = clusters[clusters[,1] == "Microglia",]
+small.counts = counts[,colnames(counts) %in% names(mg)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.mg.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="mg_zinbwave_genes.xls")
+save(res,file="mg_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="mg_zinbwave_sig_genes.xls")
+save(res.sig, file="mg_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+pdf("mg.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "plum4"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+
+select.degs<-c("Dbi","Notch1","Slc1a2","Plp1","Slc7a11","Gria2","S100a1","Jun","Sparcl1","Slc6a11","Slc6a1","Selenow","Fosb","Apoe","Gja1","S100b","Gpx4","Jund","Junb","Clu", "Ncam1","Mobp","Lars2","Cd68","Aldoc","Vtn","Sox9","Slc1a3","Enpp2","Mbp","Cox8a","Fth1","Klf9")
+
+pdf("mg.zinbwave.volcano.2.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`,
+                            selectLab = select.degs,
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "plum4"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            ylim = c(-5, 75),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+
+# subcluster dot plot
+load("~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/Microglia/subset_seurat_clustered_labeled.Rdata")
+subclusters<-subset_seurat_clustered_labeled
+rm(subset_seurat_clustered)
+
+pdf("mg.zinb.degs.cluster.dotplot.pt1.pdf",width=15,height=2.5)
+DotPlot(subclusters, 
+        features = res.sig$'Gene'[1:65]) + xlab(" ") + ylab(" ") + RotatedAxis()
+dev.off()
+
+pdf("mg.zinb.degs.cluster.dotplot.pt2.pdf",width=15,height=2.5)
+DotPlot(subclusters, 
+        features = res.sig$'Gene'[66:137]) + xlab(" ") + ylab(" ") + RotatedAxis()
+dev.off()
+
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,mg,nControl,res.summary,dds,res,res.sig,zinb,subclusters,select.degs,subset_seurat_clustered_labeled)
+
+```
+
+
+# Olig and OPC DEA
+
+```{r}
+
+# collect cluster and counts information
+oligo = clusters[clusters[,1] == "Oligodendrocytes",]
+small.counts = counts[,colnames(counts) %in% names(oligo)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(oligo)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.oligo.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="oligo_zinbwave_genes.xls")
+save(res,file="oligo_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="oligo_zinbwave_sig_genes.xls")
+save(res.sig, file="oligo_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+pdf("oligo.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "seagreen"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-1, 1),
+                            ylim = c(-1, 30),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,mg,nControl,res.summary,dds,res,res.sig,zinb,subclusters,select.degs)
+
+```
+
+
+# Smooth muscle cells DEA
+
+
+```{r}
+
+# collect cluster and counts information
+smc = clusters[clusters[,1] == "Smooth Muscle Cells",]
+small.counts = counts[,colnames(counts) %in% names(smc)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(smc)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.smc.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="smc_zinbwave_genes.xls")
+save(res,file="smc_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="smc_zinbwave_sig_genes.xls")
+save(res.sig, file="smc_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+pdf("smc.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "palevioletred2"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            ylim = c(-1, 30),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+# Endothelial cells DEA
+
+```{r}
+
+# collect cluster and counts information
+ec = clusters[clusters[,1] == "Endothelial Cells",]
+small.counts = counts[,colnames(counts) %in% names(ec)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(ec)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.ec.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="ec_zinbwave_genes.xls")
+save(res,file="ec_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="ec_zinbwave_sig_genes.xls")
+save(res.sig, file="ec_zinbwave_sig_genes.RData")
+
+
+# volcano plots
+pdf("ec.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "lightblue4"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            ylim = c(-1, 40),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+pdf("ec.zinbwave.volcano.2.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = c("Enpp2","Jun","Hes1","Lars2","Jund","Myo1b",
+                                          "Sox18","Smad7","Cst3","Flt1","Calm1","Ocln","Maoa",
+                                          "Rock1","Ifnar2","Cd47","Klf4","Ifnar1",
+                                          "Egr1","Mbp","Mobp","Fth1","Rpl35"),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "lightblue4"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-2, 2),
+                            ylim = c(-1, 40),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+
+# Macrophages DEA
+```{r}
+
+# collect cluster and counts information
+macs = clusters[clusters[,1] == "Macrophages",]
+small.counts = counts[,colnames(counts) %in% names(macs)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(macs)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.macs.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="macs_zinbwave_genes.xls")
+save(res,file="macs_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="macs_zinbwave_sig_genes.xls")
+save(res.sig, file="macs_zinbwave_sig_genes.RData")
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+# BAMs DEA
+
+```{r}
+
+# collect cluster and counts information
+macs = clusters[clusters[,1] == "BAMs",]
+small.counts = counts[,colnames(counts) %in% names(macs)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(macs)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.bams.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="bams_zinbwave_genes.xls")
+save(res,file="bams_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="bams_zinbwave_sig_genes.xls")
+save(res.sig, file="bams_zinbwave_sig_genes.RData")
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+# Pericytes DEA
+
+```{r}
+
+# collect cluster and counts information
+hold = clusters[clusters[,1] == "Pericytes",]
+small.counts = counts[,colnames(counts) %in% names(hold)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(hold)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.pericytes.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="pericytes_zinbwave_genes.xls")
+save(res,file="pericytes_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="pericytes_zinbwave_sig_genes.xls")
+save(res.sig, file="pericytes_zinbwave_sig_genes.RData")
+
+# volcano plots
+
+pdf("pericyte.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "palevioletred2"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-8, 2),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+
+# Tanycytes DEA
+
+```{r}
+
+# collect cluster and counts information
+hold = clusters[clusters[,1] == "Tanycytes",]
+small.counts = counts[,colnames(counts) %in% names(hold)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(hold)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.tanycytes.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="tanycytes_zinbwave_genes.xls")
+save(res,file="tanycytes_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="tanycytes_zinbwave_sig_genes.xls")
+save(res.sig, file="tanycytes_zinbwave_sig_genes.RData")
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+# Choroid plexus cells DEA
+
+```{r}
+
+# collect cluster and counts information
+hold = clusters[clusters[,1] == "CP cells",]
+small.counts = counts[,colnames(counts) %in% names(hold)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(hold)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.cpcells.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="cpcells_zinbwave_genes.xls")
+save(res,file="cpcells_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="cpcells_zinbwave_sig_genes.xls")
+save(res.sig, file="cpcells_zinbwave_sig_genes.RData")
+
+# volcano plots
+pdf("cpcells.zinbwave.volcano.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = as.character(res.sig$`Gene`),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "palevioletred2"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-5, 10),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+pdf("cpcells.zinbwave.volcano.2.pdf")
+EnhancedVolcano(res, 
+                            lab = res$`Gene`, 
+                            selectLab = c("Ooep","Atp5g3","Mt3","Tubb4b","Ptma",
+                                          "Calm1","Mt1","Sox9","Dbi","S100b","Vim","Nnat",
+                                          "Ucma","Sntn","Tmem212","Ccdc153","Rarres2",
+                                          "Fam183b"),
+                            x = "log2FoldChange", 
+                            y = "padj", 
+                            FCcutoff = .20,
+                            col = c("grey75", "grey75", "grey75", "palevioletred2"), 
+                            colAlpha = .5,
+                            labSize = 4,
+                            pointSize = 3,
+                            xlim = c(-5, 10),
+                            drawConnectors = T,
+                            maxoverlaps = 100
+)
+dev.off()
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+# T cells DEA
+
+```{r}
+
+# collect cluster and counts information
+hold = clusters[clusters[,1] == "T cells",]
+small.counts = counts[,colnames(counts) %in% names(hold)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(hold)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.tcells.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="tcells_zinbwave_genes.xls")
+save(res,file="tcells_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="tcells_zinbwave_sig_genes.xls")
+save(res.sig, file="tcells_zinbwave_sig_genes.RData")
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+# B cells DEA
+
+```{r}
+
+# collect cluster and counts information
+hold = clusters[clusters[,1] == "B cells",]
+small.counts = counts[,colnames(counts) %in% names(hold)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(hold)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.bcells.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="bcells_zinbwave_genes.xls")
+save(res,file="bcells_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="bcells_zinbwave_sig_genes.xls")
+save(res.sig, file="bcells_zinbwave_sig_genes.RData")
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+# Fibroblasts DEA
+
+```{r}
+
+# collect cluster and counts information
+hold = clusters[clusters[,1] == "Fibroblasts",]
+small.counts = counts[,colnames(counts) %in% names(hold)]
+small.counts = small.counts[rowSums(small.counts) > 0,]
+rm(hold)
+
+# filtering
+filter <- rowSums(small.counts >= 5) >= 5
+table(filter)
+small.counts <- small.counts[filter,]
+dim(small.counts)
+
+# collect the number of cells per condition
+nControl = length(grep('Control',colnames(small.counts)))
+KOast = length(grep('KOast',colnames(small.counts)))
+
+# assemble the column data object needed for zinbwave
+colDataframe <- DataFrame(
+  Treatment=c(rep('Control',nControl),
+              rep('KOast',KOast)),
+  row.names=colnames(small.counts))
+
+# create the summarized experiment object needed for zinbwave
+sum.exp = SummarizedExperiment(
+  assays=list(counts=small.counts), 
+  colData=colDataframe)
+
+# run zinbwave and save
+zinb<- zinbwave(sum.exp, K=0, epsilon=1000)
+save(zinb,file='zinb.fibro.Rdata')
+
+# prep for DEseq
+dds <- DESeqDataSet(zinb, design = ~ Treatment)
+dds <- estimateSizeFactors(dds, type="poscounts")
+
+# DEseq
+dds <- DESeq(dds, test="LRT", reduced=~1, useT=TRUE, minmu=1e-6, minRep=Inf)
+results(dds)
+res.summary <- results(dds, independentFiltering=FALSE)
+summary(res.summary)
+
+res<-as.data.frame(results(dds))
+res$Gene<-rownames(res)
+write.xlsx(res,file="fibro_zinbwave_genes.xls")
+save(res,file="fibro_zinbwave_genes.RData")
+
+# identify the significant ones
+res.sig <- subset(res, padj < 1e-5)
+res.sig <- subset(res.sig, log2FoldChange < -.20 | log2FoldChange > .20)
+view(res.sig)
+res.sig = categorize.deseq.df(res.sig,treat='KOast')
+table(res.sig$response)
+
+write.xlsx(res.sig, file ="fibro_zinbwave_sig_genes.xls")
+save(res.sig, file="fibro_zinbwave_sig_genes.RData")
+
+rm(small.counts,sum.exp,colDataframe,filter,KOast,nControl,res.summary,dds,res,res.sig,zinb)
+
+```
+
+
+
+
+```{r}
+sessionInfo()
+
+#R version 4.3.3 (2024-02-29)
+#Platform: aarch64-apple-darwin20 (64-bit)
+#Running under: macOS Sonoma 14.5
+
+#Matrix products: default
+#BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+#LAPACK: /Library/Frameworks/R.framework/Versions/4.3-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.11.0
+
+#locale:
+#[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+#time zone: America/New_York
+#tzcode source: internal
+
+#attached base packages:
+#[1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+#other attached packages:
+# [1] glmGamPoi_1.14.3            zinbwave_1.24.0             SingleCellExperiment_1.24.0
+# [4] openxlsx_4.2.5.2            sctransform_0.4.1           RColorBrewer_1.1-3         
+# [7] EnhancedVolcano_1.20.0      ggrepel_0.9.5               DESeq2_1.42.1              
+#[10] SummarizedExperiment_1.32.0 Biobase_2.62.0              MatrixGenerics_1.14.0      
+#[13] matrixStats_1.3.0           GenomicRanges_1.54.1        GenomeInfoDb_1.38.8        
+#[16] IRanges_2.36.0              S4Vectors_0.40.2            BiocGenerics_0.48.1        
+#[19] limma_3.58.1                metap_1.10                  clustree_0.5.1             
+#[22] ggraph_2.2.1                patchwork_1.2.0             magrittr_2.0.3             
+#[25] BiocManager_1.30.23         ggridges_0.5.6              RCurl_1.98-1.14            
+#[28] cowplot_1.1.3               scales_1.3.0                Matrix_1.6-5               
+#[31] lubridate_1.9.3             forcats_1.0.0               stringr_1.5.1              
+#[34] dplyr_1.1.4                 purrr_1.0.2                 readr_2.1.5                
+#[37] tidyr_1.3.1                 tibble_3.2.1                ggplot2_3.5.1              
+#[40] tidyverse_2.0.0             Seurat_5.1.0                SeuratObject_5.0.2         
+#[43] sp_2.1-4                   
+
+#loaded via a namespace (and not attached):
+#  [1] spatstat.sparse_3.1-0     bitops_1.0-7              httr_1.4.7               
+#  [4] numDeriv_2016.8-1.1       tools_4.3.3               utf8_1.2.4               
+#  [7] R6_2.5.1                  lazyeval_0.2.2            uwot_0.1.16              
+# [10] sn_2.1.1                  withr_3.0.0               gridExtra_2.3            
+# [13] progressr_0.14.0          cli_3.6.3                 spatstat.explore_3.2-7   
+# [16] fastDummies_1.7.3         sandwich_3.1-0            labeling_0.4.3           
+# [19] mvtnorm_1.2-5             spatstat.data_3.1-2       genefilter_1.84.0        
+# [22] pbapply_1.7-2             parallelly_1.37.1         plotrix_3.8-4            
+# [25] rstudioapi_0.16.0         RSQLite_2.3.7             generics_0.1.3           
+# [28] ica_1.0-3                 spatstat.random_3.2-3     zip_2.3.1                
+# [31] fansi_1.0.6               abind_1.4-5               lifecycle_1.0.4          
+# [34] multcomp_1.4-25           yaml_2.3.8                edgeR_4.0.16             
+# [37] mathjaxr_1.6-0            SparseArray_1.2.4         Rtsne_0.17               
+# [40] grid_4.3.3                blob_1.2.4                promises_1.3.0           
+# [43] crayon_1.5.3              miniUI_0.1.1.1            lattice_0.22-6           
+# [46] annotate_1.80.0           KEGGREST_1.42.0           pillar_1.9.0             
+# [49] knitr_1.47                future.apply_1.11.2       codetools_0.2-20         
+# [52] leiden_0.4.3.1            mutoss_0.1-13             glue_1.7.0               
+# [55] data.table_1.15.4         vctrs_0.6.5               png_0.1-8                
+# [58] spam_2.10-0               Rdpack_2.6                gtable_0.3.5             
+# [61] cachem_1.1.0              xfun_0.45                 rbibutils_2.2.16         
+# [64] S4Arrays_1.2.1            mime_0.12                 tidygraph_1.3.1          
+# [67] survival_3.7-0            statmod_1.5.0             fitdistrplus_1.1-11      
+# [70] TH.data_1.1-2             ROCR_1.0-11               nlme_3.1-165             
+# [73] bit64_4.0.5               RcppAnnoy_0.0.22          irlba_2.3.5.1            
+# [76] KernSmooth_2.23-24        colorspace_2.1-0          DBI_1.2.3                
+# [79] mnormt_2.1.1              tidyselect_1.2.1          bit_4.0.5                
+# [82] compiler_4.3.3            TFisher_0.2.0             DelayedArray_0.28.0      
+# [85] plotly_4.10.4             lmtest_0.9-40             digest_0.6.36            
+# [88] goftest_1.2-3             spatstat.utils_3.0-5      rmarkdown_2.27           
+# [91] XVector_0.42.0            htmltools_0.5.8.1         pkgconfig_2.0.3          
+# [94] sparseMatrixStats_1.14.0  fastmap_1.2.0             rlang_1.1.4              
+# [97] htmlwidgets_1.6.4         shiny_1.8.1.1             DelayedMatrixStats_1.24.0
+#[100] farver_2.1.2              zoo_1.8-12                jsonlite_1.8.8           
+#[103] BiocParallel_1.36.0       GenomeInfoDbData_1.2.11   dotCall64_1.1-1          
+#[106] munsell_0.5.1             Rcpp_1.0.12               viridis_0.6.5            
+#[109] reticulate_1.37.0         stringi_1.8.4             zlibbioc_1.48.2          
+#[112] MASS_7.3-60.0.1           plyr_1.8.9                parallel_4.3.3           
+#[115] listenv_0.9.1             deldir_2.0-4              Biostrings_2.70.3        
+#[118] graphlayouts_1.1.1        splines_4.3.3             tensor_1.5               
+#[121] multtest_2.58.0           hms_1.1.3                 locfit_1.5-9.10          
+#[124] qqconf_1.3.2              igraph_2.0.3              spatstat.geom_3.2-9      
+#[127] RcppHNSW_0.6.0            softImpute_1.4-1          reshape2_1.4.4           
+#[130] XML_3.99-0.17             evaluate_0.24.0           tzdb_0.4.0               
+#[133] tweenr_2.0.3              httpuv_1.6.15             RANN_2.6.1               
+#[136] polyclip_1.10-6           future_1.33.2             scattermore_1.2          
+#[139] ggforce_0.4.2             xtable_1.8-4              RSpectra_0.16-1          
+#[142] later_1.3.2               viridisLite_0.4.2         memoise_2.0.1            
+#[145] AnnotationDbi_1.64.1      cluster_2.1.6             timechange_0.3.0         
+#[148] globals_0.16.3  
+```
+

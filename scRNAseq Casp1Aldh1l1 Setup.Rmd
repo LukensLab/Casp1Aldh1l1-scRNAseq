@@ -1,0 +1,1431 @@
+---
+title: "scRNAseq Casp1Ast Setup"
+author: "Kristine Zengeler"
+date: "2024-06-28"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction and setup
+
+This is a compilation of multiple scRNAseq R scripts from the lab. It will take you from raw counts and barcodes all the way to DEA and plotting. It includes code for:
+* QC
+* Filtering
+* PCA
+* UMAP/tSNE clustering
+* Cluster identification
+* Sub-clustering
+* Differential expression analysis
+
+```{r}
+# Define input, results, and figures directories 
+inDir = "~/Desktop/scRNAseq_Casp1Aldh1l1_2/data/"
+resDir = "~/Desktop/scRNAseq_Casp1Aldh1l1_2/results/"
+
+# Load packages
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(ggridges)
+library(BiocManager)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(patchwork)
+library(ggraph)
+library(clustree)
+library(metap)
+library(limma)
+library(DESeq2)
+library(EnhancedVolcano)
+library(RColorBrewer)
+library(sctransform)
+library(openxlsx)
+library(zinbwave)
+library(scran)
+library(metap)
+
+
+# Set input directory
+setwd(inDir)
+```
+
+
+# Create individual Seurat objects and merge 
+
+Read in raw cell ranger files with Seurat and create a sparse matrix 
+Seurat object for each sample. Set min.features = 200 to filter out poor quality cells with less than 200 genes detected. 
+
+In this case we have a control group (Casp1 Aldh1l1 Cre-; cont) and a treatment group (Casp1 Aldh1l1 Cre+; tx). 
+
+```{r}
+# Create Seurat objects for control and treatment data
+
+for (file in c("ctrl_raw_feature_bc_matrix", "tx_raw_feature_bc_matrix")){
+  seurat_data <- Read10X(data.dir = paste0(inDir, file))
+  seurat_obj <- CreateSeuratObject(counts = seurat_data, 
+                                   min.features = 200, 
+                                   project = file)
+  assign(file, seurat_obj)
+}
+
+# Check the metadata in the new Seurat objects
+head(ctrl_raw_feature_bc_matrix@meta.data)
+head(tx_raw_feature_bc_matrix@meta.data)
+
+# Create a merged Seurat object - rename the control and treatment groups as you wish here
+merged_seurat <- merge(x = ctrl_raw_feature_bc_matrix, 
+                       y = tx_raw_feature_bc_matrix, 
+                       add.cell.id = c("Control", "KOast"))    
+
+# Check that the merged object has the appropriate sample-specific prefixes
+head(merged_seurat@meta.data)
+tail(merged_seurat@meta.data)
+
+# Examine all fields of seurat object 
+str(merged_seurat)
+
+# Check that the merged object has the appropriate sample-specific prefixes
+view(merged_seurat)
+table(merged_seurat$orig.ident)
+head(merged_seurat@meta.data)
+head(merged_seurat@active.ident)
+```
+
+```{r}
+# Remove original data and unmerged seurat objects from the environment
+rm(c= ctrl_raw_feature_bc_matrix, tx_raw_feature_bc_matrix, seurat_data, seurat_obj)
+```
+
+
+
+# QC Assessment and Filtering
+
+Standard QC assessment from seurat pipeline
+
+```{r}
+# calculate the percentage of mitochondrial genes per cell
+merged_seurat[["percent.mt"]] <- PercentageFeatureSet(merged_seurat, pattern = "^mt-")
+
+# plot QC metrics (percent.mt will be super low for snRNAseq data)
+VlnPlot(merged_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+
+Acquire additional metrics for QC
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+# Calculate mitochondrial ratio (transcripts mapping to mito genes / all transcripts)    
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^mt-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident, # new name = old name
+                      nUMI = nCount_RNA, # number of reads
+                      nGene = nFeature_RNA) # number of genes
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "Control"))] <- "Control"
+metadata$sample[which(str_detect(metadata$cells, "KOast"))] <- "KOast"
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+
+# Check to see if merged_seurat contains the new metadata
+head(merged_seurat@meta.data)
+tail(merged_seurat@meta.data)
+
+# Create .RData object to load at any time
+save(merged_seurat, file="srt_metadata.RData")
+```
+
+
+Additional QC metrics
+
+```{r,fig.show="hold",out.width="25%"}
+
+# Note the HBC GitHub tutorial does not currently recommend checking for doublets
+dir.create("QCmetrics")
+setwd(paste0(inDir, "/QCmetrics"))
+
+# Cell counts
+# Visualize the number of cell counts per sample and compare with the expected cell count numbers 
+
+pdf("cellcounts.pdf") 
+metadata %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells")
+dev.off() 
+
+# Based on our raw metada, the counts are around 18,000 for ctrl and around 25,000 for the conditional KO group 
+
+# UMI counts (transcripts) per cell
+# Visualize the number UMIs/transcripts per cell
+# Ideally UMI counts > 500 per sample 
+
+pdf("UMIcounts.pdf")
+metadata %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+dev.off() 
+
+# Visualize the distribution of genes detected per cell via histogram
+
+pdf("genecounts.pdf")
+metadata %>% 
+  ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+dev.off() 
+
+# If we see a small shoulder to the right of the major peak (not present in our data), or a bimodal distribution of the cells, that can indicate a couple of things. It might be that there are a set of cells that failed for some reason. It could also be that there are biologically different types of cells (i.e. quiescent cell populations, less complex cells of interest), and/or one type is much smaller than the other (i.e. cells with high counts may be cells that are larger in size). In this case a majority of the samples fall below 300 in gene counts with a skewed right distribution. 
+
+
+# Visualize the distribution of genes detected per cell via boxplot
+
+pdf("geneDistribution.pdf")
+metadata %>% 
+  ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+dev.off() 
+
+
+# UMIs vs. genes detected
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+
+pdf("genesvsUMIs.pdf")
+metadata %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+dev.off() 
+
+# Mitochondrial read fractions are only high in particularly low count cells with few detected genes. This could be indicative of damaged/dying cells whose cytoplasmic mRNA has leaked out through a broken membrane, and thus, only mRNA located in the mitochondria is still conserved.
+# Cells that are poor quality are likely to have low genes and UMIs per cell, and correspond to the data points in the bottom left quadrant of the plot. 
+# Good cells will generally exhibit both higher number of genes per cell and higher numbers of UMIs. However, since these samples are from the brain, perhaps the neurons are showing much higher numbers of mitochondria? 
+
+
+# Visualize the distribution of mitochondrial gene expression detected per cell - this will be super low for snRNAseq data
+
+pdf("mito_per_cell.pdf")
+metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.1)
+dev.off()
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI.  Sometimes we can detect contamination with low complexity cell types like red blood cells via this metric. Generally, we expect the novelty score to be above 0.80.
+
+pdf("complexity.pdf")
+metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)    
+dev.off() 
+
+# In this data overall complexity is high, indicating that contamination with low complexity cells is less likely. 
+```
+
+
+# Filtering the merged seurat object
+
+Filtering - choose cutoffs based on your individual project biology and QC measures. 
+
+Considering any of these QC metrics in isolation can lead to misinterpretation of cellular signals. For example, cells with a comparatively high fraction of mitochondrial counts may be involved in respiratory processes and may be cells that you would like to keep. Likewise, other metrics can have other biological interpretations. Thus, always consider the joint effects of these metrics when setting thresholds and set them to be as permissive as possible to avoid filtering out viable cell populations unintentionally. 
+
+Generic threshold guidelines
+nUMI > 500
+nGene > 250
+log10GenesPerUMI > 0.8
+mitoRatio < 0.2
+
+```{r}
+# Filter out low quality reads using selected thresholds
+filtered_seurat <- subset(x = merged_seurat, 
+                         subset= (nUMI >= 400) & # remove nuclei with low reads
+                           (nGene >= 350) & # remove nuclei with low genes per nuclei
+                           (nGene <= 5000) & # remove nuclei with really high genes per nuclei (doublets)
+                           (log10GenesPerUMI > 0.80) & # remove nuclei with low complexity (genes/reads)
+                           (mitoRatio < 0.1)) # remove nuclei with higher mitochondrial genes
+
+# observe filtered seurat object
+view(filtered_seurat)
+table(filtered_seurat$seq_folder)
+head(filtered_seurat@meta.data)
+head(filtered_seurat@active.ident)
+
+# Filter genes with zero expression in cells and keep only genes expressed in 10* or more cells 
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+# Extract counts
+filtered_seurat = JoinLayers(filtered_seurat)
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(
+  filtered_counts, meta.data = filtered_seurat@meta.data)
+
+
+```
+
+```{r}
+# Remove metadata and extra files from the environment
+rm(c= metadata, merged_seurat, nonzero, counts, keep_genes, file, filtered_counts)
+
+
+# Create .RData object to load at any time
+save(filtered_seurat, file="filtered_seurat.RData")
+```
+
+
+
+# Reassess QC metrics
+
+After performing the filtering, it's recommended to look back over the metrics to make sure that your data matches your expectations and is good for downstream analysis.
+
+```{r}
+# Subset filtered data to new metadata for reassessing QC metrics 
+metadata_clean <- filtered_seurat@meta.data
+
+setwd(paste0(inDir, "/QCmetrics"))
+
+# Cell counts
+# Visualize the number of cell counts per sample and compare with the expected cell count numbers 
+pdf("Fcellcounts.pdf") 
+metadata_clean %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells")
+dev.off() 
+# now we have about 10,000 Cre- cells and around 17,000 Cre+ cells. this is right on goal with the target of 10k cells per condition loaded at the sequencing core. 
+
+# Let's count them up!
+length(metadata_clean$sample[metadata_clean$sample == "Control"]) # 10,444 cells
+length(metadata_clean$sample[metadata_clean$sample == "KOast"]) # 17,864 cells
+
+# UMI counts (transcripts) per cell
+# Visualize the number UMIs/transcripts per cell
+# Ideally UMI counts > 500 per sample  
+pdf("FUMIcounts.pdf")
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+dev.off() 
+
+# Genes detected per cell
+# Visualize the distribution of genes detected per cell via histogram
+pdf("Fgenecounts.pdf")
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+dev.off() 
+
+# Visualize the distribution of genes detected per cell via boxplot
+pdf("FgeneDistribution.pdf")
+metadata_clean %>% 
+  ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+dev.off() 
+
+# UMIs vs. genes detected
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+pdf("FgenesvsUMIs.pdf")
+metadata_clean %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+dev.off() 
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+pdf("Fmitogenes.pdf")
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+dev.off() 
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+pdf("Fcomplexity.pdf")
+metadata_clean %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)    
+dev.off()  
+
+```
+
+
+```{r}
+# Remove metadata from the environment
+rm(metadata_clean)
+
+# Create .RData object to load at any time
+save(filtered_seurat, file= paste0(inDir, "/srt_QC_filtered.RData"))
+```
+
+
+# Normalization, scaling, and integration with SCTransform method
+
+In these steps, you want to try and optimize the variation in the data due to biological differences and minimize effects of variation due to sequencing depth, cell cycle differences, mitochondrial expression, batch effects, etc.)
+
+```{r}
+# Fist load prior data created with previous steps, if necessary. 
+load(paste0(inDir, "/srt_QC_filtered.RData"))
+
+# Examine seurat object and meta data 
+head(filtered_seurat)
+head(filtered_seurat@meta.data)
+tail(filtered_seurat)
+
+# Check the variations due to cell cycle differences first. 
+
+# Calculate a rough normalize count 
+seurat_phase <- NormalizeData(filtered_seurat)
+
+# Load cell cycle markers (mus muculus) - provided in file list
+setwd(inDir)
+load("s_genes.RData")
+load("g2m_genes.RData")
+
+# Score cells for cell cycle
+seurat_phase <- CellCycleScoring(seurat_phase, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+# View cell cycle scores and phases assigned to cells                                 
+View(seurat_phase@meta.data)               
+
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase, 
+                                     selection.method = "vst",
+                                     nfeatures = 2000, 
+                                     verbose = FALSE)
+
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase)
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# Plot the PCA colored by cell cycle phase
+setwd(resDir)
+dir.create("Integration")
+setwd(paste0(resDir, "Integration"))
+
+pdf("ccPCA.pdf") 
+DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+dev.off()
+
+# If you do not see large differences due to cell cycle phase, you do not need to regress out the variation due to cell cycle. 
+
+```
+
+# SCT Transform
+
+This is a more accurate method of normalizing -- accounts for cellular sequencing depth (nUMIs). Will perform on the filtered_seurat object. 
+
+In this case, since we are dealing with brain tissue and differences in mitochondrial expression may help distinguish different cell clusters, we will not regress out variation due to mito expression.
+
+```{r}
+
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+
+split_seurat <- split_seurat[c("Control", "KOast")]
+
+for (i in 1:length(split_seurat)) {
+  split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
+  split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m_genes, s.features=s_genes)
+  split_seurat[[i]] <- SCTransform(split_seurat[[i]], variable.features.n = 3000)
+} 
+
+# NOTE: By default, after normalizing, adjusting the variance, and regressing out uninteresting sources of variation, SCTransform will rank the genes by residual variance and output the 3000 most variant genes. If the dataset has larger cell numbers, then it may be beneficial to adjust this parameter higher using the variable.features.n argument.
+
+# Check which assays are stored in objects. We will use different assays for different parts of the analysis. 
+split_seurat$Control@assays
+# RNA and SCT are currently listed
+
+```
+
+# Integration
+
+Steps:
+* Canonical correlation analysis (CCA)
+* Identify anchors or mutual nearest neighbors (MNNs) across datasets
+* Filter anchors
+* Integrate
+
+```{r}
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
+                                            nfeatures = 3000) 
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
+                                   anchor.features = integ_features)
+
+# Perform canonical correlation analysis (CCA)
+# find the best anchors and filter incorrect anchors - this step can take a while to run
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features)
+
+# Integrate across conditions
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT")
+
+```
+
+
+```{r}
+# Save integrated seurat object
+saveRDS(seurat_integrated, paste0(resDir, "seurat_integrated.rds"))
+
+# Cleanup
+rm(c = filtered_seurat, integ_anchors, seurat_phase, split_seurat, g2m_genes, i, integ_features, s_genes)
+```
+
+
+# Determine dimensionality and resolution
+
+```{r}
+# Set working directory
+setwd(paste0(resDir, "Integration"))
+
+# Fist load prior data created with previous steps, if necessary. 
+load(paste0(inDir, "/seurat_integrated.rds"))
+```
+
+
+PCA and UMAP
+
+```{r}
+# Use integrated data to assess dimensionality and resolution
+DefaultAssay(seurat_integrated) <- "integrated"
+
+### PCA
+# Run PCA
+seurat_integrated <- RunPCA(object = seurat_integrated, verbose = FALSE)
+
+# Plot PCA
+pdf("PCA.pdf") 
+PCAPlot(seurat_integrated,
+        split.by = "sample")  
+dev.off()
+
+### Check dimensionality
+ElbowPlot(seurat_integrated, ndims = 50)
+
+
+# I am using a very high dimensionality since SCTransform allows for higher dimensionality - see Seurat "Using sctransform in Seurat" vignette - https://satijalab.org/seurat/articles/sctransform_vignette.html
+
+# Run integrated UMAP
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                             dims = 1:50,
+                             reduction = "pca")
+# Plot integrated UMAP  
+pdf("UMAP_int.pdf")                           
+DimPlot(seurat_integrated)  
+dev.off()
+
+# Plot UMAP  
+pdf("UMAP_splitsample.pdf")                           
+DimPlot(seurat_integrated, split.by = "sample")   
+dev.off()
+
+
+
+## tSNE clustering is more commonly used now. We will repeat the clustering using this method of reduction for dimensionality.
+
+# Run integrated tSNE
+seurat_integrated_tsne <- RunTSNE(seurat_integrated, dims = 1:50)
+
+
+# Plot integrated tSNE  
+pdf("tSNE_int.pdf")                           
+DimPlot(object = seurat_integrated_tsne, reduction = "tsne")
+dev.off()
+
+# Plot tSNE  
+pdf("tSNE_splitsample.pdf")                           
+DimPlot(seurat_integrated_tsne, reduction = "tsne", split.by = "sample")   
+dev.off()
+
+```
+
+
+```{r}
+# Save the new seurat objects
+saveRDS(seurat_integrated_tsne, paste0(resDir, "seurat_integrated_tsne.RData"))
+
+# Cleanup
+rm(seurat_integrated)
+```
+
+
+# Cell clustering 
+
+Testing clustering resolutions and identifing the specific types of cells in your sample. This can be a highly iterative process between clustering and marker identification (sometimes even going back to the QC filtering).
+
+```{r}
+# Read in data generated from integration step
+seurat_integrated <- readRDS(paste0(resDir, "seurat_integrated_tsne.RData"))
+# or, rename
+seurat_integrated <- seurat_integrated_tsne
+rm(seurat_integrated_tsne)
+
+# Create specific directory for this output
+setwd(resDir)
+dir.create("Clustering")
+setwd(paste0(resDir, "Clustering/"))
+
+```
+
+# Identify significant PCs
+
+Prior to the creation of the SCTransform function in Seurat, there were two methods for determining selection of PCs. 
+(1) Looking at heatmaps of the top ~10 PCs. 
+(2) Elbow plots. 
+
+See scRNA-seq_hbctraining/lessons/07_SC_clustering_cells_SCT.md for more details. These are not really necessary anymore, but I kept the code here in case someone is curious. 
+
+```{r}
+
+# Explore heatmap of PCs
+pdf("PC_heatmap.pdf")
+DimHeatmap(seurat_integrated,
+           dims = 1:9,
+           cells = 500,
+           balanced = TRUE)
+dev.off()
+
+# Print out the top 10 (or more) positive and negative genes by PCA scores driving the PCs
+PC.genelist <- capture.output(print(x = seurat_integrated[["pca"]], dims = 1:10,
+                                    nfeatures = 10))
+PC.genelist
+
+# Elbow plot - visualizes the standard deviation of each PC. Where the elbow appears is usually the threshold for identifying the majority of the variation. However, this method can be quite subjective.
+
+# Plot the elbow plot
+pdf("ElbowPlot.pdf")
+ElbowPlot(object = seurat_integrated,
+          ndims = 100)
+dev.off()
+
+# Now, SCTransform is more accurate -- the higher number of PCs you chose the better, but it will just take longer to process. For this project, the Elbow plot slope is nearing zero around 40-50 PCs. We will try using 50. 
+```
+
+
+# Testing clustering resolutions 
+
+The resolution is an important argument that sets the "granularity" of the downstream clustering and will need to be optimized for every individual experiment. For datasets of 3,000 - 5,000 cells, the resolution set between 0.4-1.4 generally yields good clustering. 
+
+Increased resolution values lead to a greater number of clusters, which is often required for larger datasets. 
+
+
+```{r}
+# Determine the K-nearest neighbor graph
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                   dims = 1:50)
+
+# Determine the clusters for various resolutions  
+
+# The FindClusters() function allows us to enter a series of resolutions and will calculate the "granularity" of the clustering. This is very helpful for testing which resolution works for moving forward without having to run the function for each resolution.
+
+seurat_integrated <- FindClusters(
+  object = seurat_integrated, resolution = c(0.1,0.2,0.4,0.6,0.8,1.0,1.4,1.8))
+
+# Explore resolutions
+seurat_integrated@meta.data %>% 
+  View()
+
+
+# Assign identity of clusters - try out an intermediate resolution first
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.6"
+DimPlot(seurat_integrated,
+        reduction = "tsne",
+        label = TRUE,
+        label.size = 6) + NoLegend()
+## 32 clusters
+
+# Trying the lowest resolution
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.1"
+DimPlot(seurat_integrated,
+        reduction = "tsne",
+        label = TRUE,
+        label.size = 6) + NoLegend()
+# 18 clusters. Some clearly independent clusters are grouped together - not ideal. 
+
+# Trying the highest resolution
+Idents(object = seurat_integrated) <- "integrated_snn_res.1.8"
+DimPlot(seurat_integrated,
+        reduction = "tsne",
+        label = TRUE,
+        label.size = 6) + NoLegend()
+# 49 clusters. A bit too much granularity for this step. We can add these subclusters after identifying major cell types. 
+
+# Intermediate resolution
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.4"
+DimPlot(seurat_integrated,
+        reduction = "tsne",
+        label = TRUE,
+        label.size = 6) + NoLegend()
+# 27 clusters. Going with this one. Each island is defined. 
+
+# change name of seurat object to clustered_seurat
+seurat_clustered <- seurat_integrated
+
+# cleanup
+rm(seurat_integrated)
+```
+
+
+# Clustering QC
+
+Recs: identify any junk clusters for removal. Possible junk clusters could include those with high mitochondrial content and low UMIs/genes
+
+If not detecting all cell types as separate clusters, try changing the tSNE resolution, the number of PCs used for clustering, or the number of variable genes used
+
+
+```{r}
+
+# tSNE of cells in each cluster by sample
+pdf("UMAP_cluster_distribution.pdf")
+DimPlot(seurat_clustered, 
+        reduction = "tsne",
+        label = TRUE, 
+        split.by = "sample")  + NoLegend()
+dev.off()
+
+# Explore whether clusters segregate by cell cycle phase
+pdf("UMAP_cc_distribution.pdf")
+DimPlot(seurat_clustered,
+        reduction = "tsne",
+        label = TRUE, 
+        split.by = "Phase")  + NoLegend()
+dev.off()
+
+# Segregation of clusters by various sources of uninteresting variation
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics <-  c("nUMI", "nGene", "S.Score", "G2M.Score", "mitoRatio")
+
+pdf("cluster_featurePlot.pdf")
+FeaturePlot(seurat_clustered, 
+            reduction = "tsne", 
+            features = metrics,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+dev.off()
+
+
+# Examine PCA results 
+print(seurat_clustered[["pca"]], dims = 1:5, nfeatures = 5)
+
+```
+
+# Segregation of clusters by sample
+
+Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+
+```{r}
+n_cells <- FetchData(seurat_clustered, 
+                     vars = c("sample","seurat_clusters")) %>% 
+  dplyr::count(sample, seurat_clusters) %>% 
+  tidyr::spread(sample, n)
+
+# View table
+View(n_cells)
+
+## Visualize the breakdown of cell clusters per condition
+
+pt <- table(Idents(seurat_clustered), seurat_clustered$orig.ident)
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+view(pt)
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) +
+  theme_classic(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Proportion") +
+  theme(legend.title = element_blank())
+
+```
+
+```{r}
+# Save the number of cells per cluster as a .csv file
+write.csv(n_cells, file = paste0(resDir, "n_cells.xls"))
+
+# Cleanup
+rm(c = n_cells, metrics, PC.genelist, pt, pc_data, umap_label, columns)
+```
+
+
+# Analyzing cluster identities
+
+Using FindConservedMarkers
+
+```{r}
+
+setwd(resDir)
+dir.create("ClusterID")
+setwd(paste0(resDir,"ClusterID"))
+
+
+# cluster 0
+cluster0_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 0,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster0_conserved_markers, file = paste0(resDir, "cluster0_conserved_markers.Rdata"))
+# cluster 1
+cluster1_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 1,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster1_conserved_markers, file = paste0(resDir, "cluster1_conserved_markers.Rdata"))
+# cluster 2
+cluster2_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 2,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster2_conserved_markers, file = paste0(resDir, "cluster2_conserved_markers.Rdata"))
+# cluster 3
+cluster3_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 3,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster3_conserved_markers, file = paste0(resDir, "cluster3_conserved_markers.Rdata"))
+# cluster 4
+cluster4_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 4,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster4_conserved_markers, file = paste0(resDir, "cluster4_conserved_markers.Rdata"))
+# cluster 5
+cluster5_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 5,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster5_conserved_markers, file = paste0(resDir, "cluster5_conserved_markers.Rdata"))
+# cluster 6
+cluster6_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 6,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster6_conserved_markers, file = paste0(resDir, "cluster6_conserved_markers.Rdata"))
+# cluster 7
+cluster7_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 7,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster7_conserved_markers, file = paste0(resDir, "cluster7_conserved_markers.Rdata"))
+# cluster 8
+cluster8_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 8,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster8_conserved_markers, file = paste0(resDir, "cluster8_conserved_markers.Rdata"))
+# cluster 9
+cluster9_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 9,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster9_conserved_markers, file = paste0(resDir, "cluster9_conserved_markers.Rdata"))
+# cluster 10
+cluster10_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 10,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster10_conserved_markers, file = paste0(resDir, "cluster10_conserved_markers.Rdata"))
+# cluster 11
+cluster11_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 11,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster11_conserved_markers, file = paste0(resDir, "cluster11_conserved_markers.Rdata"))
+# cluster 12
+cluster12_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 12,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster12_conserved_markers, file = paste0(resDir, "cluster12_conserved_markers.Rdata"))
+# cluster 13
+cluster13_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 13,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster13_conserved_markers, file = paste0(resDir, "cluster13_conserved_markers.Rdata"))
+# cluster 14
+cluster14_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 14,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster14_conserved_markers, file = paste0(resDir, "cluster14_conserved_markers.Rdata"))
+# cluster 15
+cluster15_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 15,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster15_conserved_markers, file = paste0(resDir, "cluster15_conserved_markers.Rdata"))
+# cluster 16
+cluster16_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 16,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster16_conserved_markers, file = paste0(resDir, "cluster16_conserved_markers.Rdata"))
+# cluster 17
+cluster17_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 17,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster17_conserved_markers, file = paste0(resDir, "cluster17_conserved_markers.Rdata"))
+# cluster 18
+cluster18_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 18,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster18_conserved_markers, file = paste0(resDir, "cluster18_conserved_markers.Rdata"))
+# cluster 19
+cluster19_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 19,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster19_conserved_markers, file = paste0(resDir, "cluster19_conserved_markers.Rdata"))
+# cluster 20
+cluster20_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 20,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster20_conserved_markers, file = paste0(resDir, "cluster20_conserved_markers.Rdata"))
+# cluster 21
+cluster21_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 21,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster21_conserved_markers, file = paste0(resDir, "cluster21_conserved_markers.Rdata"))
+# cluster 22
+cluster22_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 22,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster22_conserved_markers, file = paste0(resDir, "cluster22_conserved_markers.Rdata"))
+# cluster 23
+cluster23_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 23,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster23_conserved_markers, file = paste0(resDir, "cluster23_conserved_markers.Rdata"))
+# cluster 24
+cluster24_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 24,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster24_conserved_markers, file = paste0(resDir, "cluster24_conserved_markers.Rdata"))
+# cluster 25
+cluster25_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 25,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster25_conserved_markers, file = paste0(resDir, "cluster25_conserved_markers.Rdata"))
+# cluster 26
+cluster26_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 26,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster26_conserved_markers, file = paste0(resDir, "cluster26_conserved_markers.Rdata"))
+# cluster 27
+cluster27_conserved_markers <- FindConservedMarkers(seurat_clustered,ident.1 = 27,grouping.var = "sample",only.pos = TRUE,logfc.threshold = 0.25)
+save(cluster27_conserved_markers, file = paste0(resDir, "cluster27_conserved_markers.Rdata"))
+
+```
+
+
+Collate all of the top markers into a list
+```{r}
+Top1_Sig_Markers_List <- cluster0_conserved_markers %>%
+  top_n(n = -1, wt = Control_p_val_adj) %>% #first sort by p value to find all the top hits
+  top_n(n = 1, wt = Control_pct.1) %>% # then narrow the list down by top principal component
+  top_n(n = 1, wt = Control_avg_log2FC) # then select the top marker by average log2FC
+
+hold <- cluster1_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster2_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster3_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster4_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster5_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster6_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster7_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+#hold <- cluster8_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+# vtn1 top hit, but "doesn't exist" when trying to plot
+# slc1a21 also "doesn't exist
+# take the third best option
+hold <- cluster8_conserved_markers %>% top_n(n = -3, wt = Control_p_val_adj) %>% top_n(n = -1, wt = Control_pct.1)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+
+#hold <- cluster9_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+# vtn2 top hit, but "doesn't exist" when trying to plot
+# the next best option is vtn, which is already a hit gene for another cluster
+# take the third best option
+hold <- cluster9_conserved_markers %>% top_n(n = -2, wt = Control_p_val_adj) %>% top_n(n = 2, wt = Control_pct.1) %>% top_n(n = -1, wt = Control_pct.1)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster10_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster11_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster12_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster13_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster14_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster15_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+#hold <- cluster16_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+# not a mapped gene, choose the next best option
+hold <- cluster16_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 2, wt = Control_pct.1) %>% top_n(n = -1, wt = Control_pct.1) 
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster17_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster18_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster19_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster20_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster21_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster22_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster23_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster24_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster25_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster26_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+hold <- cluster27_conserved_markers %>% top_n(n = -1, wt = Control_p_val_adj) %>% top_n(n = 1, wt = Control_pct.1) %>% top_n(n = 1, wt = Control_avg_log2FC)
+Top1_Sig_Markers_List <- rbind(Top1_Sig_Markers_List, hold)
+
+
+pdf("top_cluster_marker_dotplot.pdf")
+DotPlot(seurat_clustered, 
+        features = unique(rownames(Top1_Sig_Markers_List))) + RotatedAxis()
+dev.off()
+
+save(Top1_Sig_Markers_List, file = paste0(resDir, "Top1_Sig_Markers_List.Rdata"))
+
+```
+
+
+Using FindAllMarkers
+
+```{r}
+
+# use RNA data to assess gene expression contributing to clustering
+#DefaultAssay(seurat_clustered) <- "RNA"
+#seurat_clustered <- JoinLayers(seurat_clustered)
+
+# Find all sig markers for each cluster compared to all other clusters. 
+#All_Sig_Markers <- FindAllMarkers(
+  #seurat_clustered, 
+  #only.pos = T, 
+  #logfc.threshold = 0.25, 
+  #assay = "RNA")
+
+# Prepare lists of significant markers
+#All_Sig_Markers_List <- All_Sig_Markers %>%
+  #group_by('active.ident') %>%
+  #top_n(n = 100, wt = avg_log2FC)
+
+#Top10_Sig_Markers_List <- All_Sig_Markers %>%
+  #group_by(cluster) %>%
+  #top_n(n = 10, wt = avg_log2FC)
+
+#Top1_Sig_Markers_List <- All_Sig_Markers %>%
+  #group_by(cluster) %>%
+  #top_n(n = 1, wt = avg_log2FC)
+
+```
+
+```{r}
+# save the seurat file!
+#save(seurat_clustered, file = paste0(resDir, "seurat_clustered.Rdata"))
+
+# save the list
+#save(All_Sig_Markers, file = paste0(resDir, "All_Sig_Markers.Rdata"))
+#save(All_Sig_Markers_List, file = paste0(resDir, "All_Sig_Markers_List.Rdata"))
+#save(Top10_Sig_Markers_List, file = paste0(resDir, "Top10_Sig_Markers_List.Rdata"))
+#save(Top1_Sig_Markers_List, file = paste0(resDir, "Top1_Sig_Markers_List.Rdata"))
+
+# Export significant markers to .csv file. Make sure to save file as .xls file!
+#write.xlsx(All_Sig_Markers, file = paste0(resDir, "cluster_markers.xls"))
+#write.xlsx(All_Sig_Markers_List, file = paste0(resDir, "all_sig_markers.xls"))
+#write.xlsx(Top10_Sig_Markers_List, file = paste0(resDir, "top10_sig_markers.xls"))
+#write.xlsx(Top1_Sig_Markers_List, file = paste0(resDir, "top1_sig_markers.xls"))
+
+# Remove unused data from the environment
+#rm(All_Sig_Markers)
+#rm(All_Sig_Markers_List)
+
+```
+
+
+# Test gene expression across clusters
+
+```{r}
+# tsne plot, for reference
+
+pdf("tSNE_unlabled.pdf")
+DimPlot(seurat_clustered, 
+        reduction = "tsne",
+        label = TRUE)  + NoLegend()
+dev.off()
+
+
+# use a feature plot to show genes of interest
+
+pdf("key_cluster_marker_feature_plots.pdf")
+FeaturePlot(seurat_clustered,
+            reduction = "tsne", 
+            features = c("nUMI","nGene", "mitoRatio", "log10GenesPerUMI", "Hexb", "Cx3cr1", "Aqp4", "Slc1a3", "Gfap", "Mbp", "Pdgfrb", "Olig1", "Mapt", "Bsn", "Flt1", "Vtn"),
+            # split.by = "sample",
+            # min.cutoff = 'q10',
+            label = TRUE,
+            cols = c("lightgrey", "royalblue3"),
+            pt.size = .8)
+dev.off()
+
+# plots of the top markers of each cell typecluster
+
+pdf("top_cluster_marker_feature_plot.pdf")
+FeaturePlot(seurat_clustered,
+            reduction = "tsne", 
+            features = rownames(Top1_Sig_Markers_List),
+            label = TRUE,
+            cols = c("lightgrey", "royalblue3"),
+            pt.size = .8)
+dev.off()
+
+
+```
+
+Create stacked violin plot
+
+```{r}
+
+# Used code from this place https://divingintogeneticsandgenomics.rbind.io/post/stacked-violin-plot-for-visualizing-single-cell-data-in-seurat/
+# remove the x-axis text and tick
+# plot.margin to adjust the white space between each plot.
+# ... pass any arguments to VlnPlot in Seurat
+modify_vlnplot<- function(obj, 
+                          feature, 
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  p<- VlnPlot(obj, features = feature, pt.size = pt.size, ... )  + 
+    xlab("") + ylab(feature) + ggtitle("") + 
+    theme(legend.position = "none", 
+          axis.text.x = element_blank(), 
+          axis.ticks.x = element_blank(), 
+          axis.title.y = element_text(size = rel(1), angle = 0), 
+          axis.text.y = element_text(size = rel(1)), 
+          plot.margin = plot.margin ) 
+  return(p)
+}
+## extract the max value of the y axis
+extract_max<- function(p){
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  return(ceiling(ymax))
+}
+## main function
+StackedVlnPlot<- function(obj, features,
+                          pt.size = 0, 
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          ...) {
+  
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  
+  # Add back x-axis title to bottom plot. patchwork is going to support this?
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    theme(axis.text.x=element_text(), axis.ticks.x = element_line())
+  
+  # change the y-axis tick to only max value 
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + 
+                            scale_y_continuous(breaks = c(y)) + 
+                            expand_limits(y = y))
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+  
+#### Now able to use: StackedVlnPlot() to create a stacked violin plot that is easy to read with multipe features
+}
+```
+
+# Manual cluster ID extravaganza
+
+```{r}
+# Use a stacked violin plot to show genes of interest
+# Any feature that is not detected will cause an error. Features not found must be commented out and then rerun.
+
+StackedVlnPlot(obj = seurat_clustered, features = c("Aldh1l1","Pdgfrb","Flt1","Snap25","Cx3cr1","Mbp","Slc1a3","Tmem119"))
+
+#microglia
+StackedVlnPlot(obj = seurat_clustered, features = c("Hexb", "P2ry12", "Cx3cr1", "C1qa", "Csf1r"))
+#astrocytes
+StackedVlnPlot(obj = seurat_clustered, features = c("Aldh1l1","Gfap","Gria2","Slc6a1","Bcan","Aldoc","S100b","Aqp4"))
+#opc
+StackedVlnPlot(obj = seurat_clustered, features = c("Pdgfra", "Sox10", "Olig1", "Olig2", "Cspg4"))
+#oligo
+StackedVlnPlot(obj = seurat_clustered, features = c("Mal", "Ermn", "Mog", "Plp1", "Cadm4", "Dbi", "Mbp"))
+#bam
+StackedVlnPlot(obj = seurat_clustered, features = c("Mrc1", "Pf4", "Apoe", "Ms4a7", "F13a1"))
+#endothelial cells
+StackedVlnPlot(obj = seurat_clustered, features = c("Cldn5", "Ly6c1", "Flt1", "Pltp", "Slco1a4", "Itm2a", "Ly6a"))
+#choiroid plexus cells
+StackedVlnPlot(obj = seurat_clustered, features = c("Folr1", "Kcnj13", "Ttr", "Enpp2", "Prlr"))
+#pericytes
+StackedVlnPlot(obj = seurat_clustered, features = c("Kcnj8", "Pdgfrb", "Vtn", "Atp13a5"))
+#fibroblast
+StackedVlnPlot(obj = seurat_clustered, features = c("Spp1", "Apod", "Ptgds", "Mfap4", "Col1a1", "Col3a1", "Col5a1", "Col12a1", "Fbln2"))
+#smooth muscle cell
+StackedVlnPlot(obj = seurat_clustered, features = c("Mylk", "Tpm2", "Tpm1", "Crip1", "Acta2", "Myh11", "Tagln"))
+#capillary EC
+StackedVlnPlot(obj = seurat_clustered, features = c("Slc7a5", "Slc16a1", "Mfsd2a", "Ivns1abp", "Cxcl12"))
+#monocytes
+StackedVlnPlot(obj = seurat_clustered, features = c("Ccr2","Cd74","Cd44","Cd14"))
+#macrophage
+StackedVlnPlot(obj = seurat_clustered, features = c("Itgam", "Adgre1", "Cd68"))
+#venous EC	
+StackedVlnPlot(obj = seurat_clustered, features = c("Slc38a5", "Vwf", "Slc38a5"))
+#lymphatic EC	
+StackedVlnPlot(obj = seurat_clustered, features = c("Lyve1", "Pdpn", "Prox1"))
+#t cell
+StackedVlnPlot(obj = seurat_clustered, features = c("Cd4", "Cd3d", "Il7r", "Ccr7", "Cd8a"))
+#b cell
+StackedVlnPlot(obj = seurat_clustered, features = c("Cd79a", "Cd19", "Ms4a1"))
+#mature neuron
+StackedVlnPlot(obj = seurat_clustered, features = c("Rbfox3","Map2","Gap43","Syp", "Dlg4", "Bsn"))
+#immature neuron
+StackedVlnPlot(obj = seurat_clustered, features = c("Dcx","Ncam1","Neurod1"))
+#serotonergic neurons
+StackedVlnPlot(obj = seurat_clustered, features = c("Gli2", "Oxtr", "Tacr3"))
+#excitatory neurons
+StackedVlnPlot(obj = seurat_clustered, features = c("Cux2","Nrgn","Slc17a7","Tbr1"))
+#inhibitory neurons
+StackedVlnPlot(obj = seurat_clustered, features = c("Gad1","Pvalb","Slc32a1","Sst","Vip"))
+#astrocytic endfeet
+StackedVlnPlot(obj = seurat_clustered, features = c("Ccdc153", "Dmkn", "Fam183b", "Ccdc180", "Aqp4", "Tmem212"))
+#tanycyte
+StackedVlnPlot(obj = seurat_clustered, features = c("Ppp1r1b", "Vim", "Rax", "Dio2", "Slc16a2", "Col23a1", "Lhx2", "Prdx6", "Ptn"))
+
+```
+
+```{r}
+save(seurat_clustered, file = paste0(resDir, "seurat_clustered.Rdata"))
+```
+
+## Name those clusters!!!
+
+```{r}
+
+# load in data, if necessary
+load(paste0(resDir, "seurat_clustered.Rdata"))
+load(paste0(resDir, "All_Sig_Markers.Rdata"))
+
+
+# Assign identity of clusters based on resolution of choice
+Idents(object = seurat_clustered) <- "integrated_snn_res.0.4"
+DimPlot(seurat_clustered, 
+        reduction = "tsne",
+        label = TRUE)  + NoLegend()
+
+# Rename all identities ("old cluster name" = "new cluster name")
+# Clusters with the same name will be merged together
+seurat_clustered_labeled <- RenameIdents(seurat_clustered, 
+                                         "0" = "Astrocytes",
+                                         "1" = "Microglia", 
+                                         "2" = "Endothelial Cells",
+                                         "3" = "Oligodendrocytes",
+                                         "4" = "Astrocytes",
+                                         "5" = "Smooth Muscle Cells",
+                                         "6" = "Pericytes",
+                                         "7" = "Microglia",
+                                         "8" = "Astrocytes",
+                                         "9" = "Endothelial Cells",
+                                         "10" = "Neurons",
+                                         "11" = "OPCs",
+                                         "12" = "Neurons",
+                                         "13" = "BAMs",
+                                         "14" = "Oligodendrocytes",
+                                         "15" = "Tanycytes",
+                                         "16" = "CP cells",
+                                         "17" = "Immature Neurons",
+                                         "18" = "T cells",
+                                         "19" = "Astrocytes",
+                                         "20" = "Macrophages", 
+                                         "21" = "Oligodendrocytes", 
+                                         "22" = "Pericytes",
+                                         "23" = "Fibroblasts",
+                                         "24" = "Endothelial Cells", 
+                                         "25" = "B cells",
+                                         "26" = "Endothelial Cells",
+                                         "27" = "Immature Neurons"
+)
+
+
+pdf("tSNE.res4.labels.pdf")
+DimPlot(seurat_clustered_labeled, 
+        reduction = "tsne", 
+        repel = T, 
+        label.box = T,
+        label = TRUE) + NoLegend()
+dev.off()
+
+pdf("tSNE.res4.legend.pdf")
+DimPlot(seurat_clustered_labeled, reduction = "tsne") 
+dev.off()
+
+# pick out only the top marker for each cell category (ie remove markers for secondary clusters, since clusters were combined to create final cell categories)
+Top1_Sig_Markers_List_condensed <- Top1_Sig_Markers_List[c(1:4,6:7,11:12,14,16:19,21,24,26), ]
+
+
+pdf("top_cluster_marker_dotplot_labels.pdf",width=8,height=5)
+DotPlot(seurat_clustered_labeled, 
+        features = rownames(Top1_Sig_Markers_List_condensed)) + xlab(" ") + 
+              ylab(" ") + RotatedAxis()
+dev.off()
+
+```
+
+```{r}
+save(seurat_clustered_labeled, file = paste0(resDir, "seurat_clustered_labeled.Rdata"))
+
+rm(seurat_clustered,seurat_integrated,Top1_Sig_Markers_List,Top1_Sig_Markers_List_condensed,Top10_Sig_Markers_List,cluster_marker_top)
+rm(cluster0_conserved_markers,cluster1_conserved_markers,cluster2_conserved_markers,cluster3_conserved_markers,cluster4_conserved_markers,cluster5_conserved_markers,cluster6_conserved_markers,cluster7_conserved_markers,cluster8_conserved_markers,cluster9_conserved_markers,cluster10_conserved_markers,cluster11_conserved_markers,cluster12_conserved_markers,cluster13_conserved_markers,cluster14_conserved_markers,cluster15_conserved_markers,cluster16_conserved_markers,cluster17_conserved_markers,cluster18_conserved_markers,cluster19_conserved_markers,cluster20_conserved_markers,cluster21_conserved_markers,cluster22_conserved_markers,cluster23_conserved_markers,cluster24_conserved_markers,cluster25_conserved_markers,cluster26_conserved_markers,cluster27_conserved_markers)
+```
+
+
+```{r}
+sessionInfo()
+
+#R version 4.3.3 (2024-02-29)
+#Platform: aarch64-apple-darwin20 (64-bit)
+#Running under: macOS Sonoma 14.5
+
+#Matrix products: default
+#BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+#LAPACK: /Library/Frameworks/R.framework/Versions/4.3-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.11.0
+
+#locale:
+#[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+#time zone: America/New_York
+#tzcode source: internal
+
+#attached base packages:
+#[1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+#other attached packages:
+# [1] glmGamPoi_1.14.3            zinbwave_1.24.0             SingleCellExperiment_1.24.0
+# [4] openxlsx_4.2.5.2            sctransform_0.4.1           RColorBrewer_1.1-3         
+# [7] EnhancedVolcano_1.20.0      ggrepel_0.9.5               DESeq2_1.42.1              
+#[10] SummarizedExperiment_1.32.0 Biobase_2.62.0              MatrixGenerics_1.14.0      
+#[13] matrixStats_1.3.0           GenomicRanges_1.54.1        GenomeInfoDb_1.38.8        
+#[16] IRanges_2.36.0              S4Vectors_0.40.2            BiocGenerics_0.48.1        
+#[19] limma_3.58.1                metap_1.10                  clustree_0.5.1             
+#[22] ggraph_2.2.1                patchwork_1.2.0             magrittr_2.0.3             
+#[25] BiocManager_1.30.23         ggridges_0.5.6              RCurl_1.98-1.14            
+#[28] cowplot_1.1.3               scales_1.3.0                Matrix_1.6-5               
+#[31] lubridate_1.9.3             forcats_1.0.0               stringr_1.5.1              
+#[34] dplyr_1.1.4                 purrr_1.0.2                 readr_2.1.5                
+#[37] tidyr_1.3.1                 tibble_3.2.1                ggplot2_3.5.1              
+#[40] tidyverse_2.0.0             Seurat_5.1.0                SeuratObject_5.0.2         
+#[43] sp_2.1-4                   
+
+#loaded via a namespace (and not attached):
+#  [1] spatstat.sparse_3.1-0     bitops_1.0-7              httr_1.4.7               
+#  [4] numDeriv_2016.8-1.1       tools_4.3.3               utf8_1.2.4               
+#  [7] R6_2.5.1                  lazyeval_0.2.2            uwot_0.1.16              
+# [10] sn_2.1.1                  withr_3.0.0               gridExtra_2.3            
+# [13] progressr_0.14.0          cli_3.6.3                 spatstat.explore_3.2-7   
+# [16] fastDummies_1.7.3         sandwich_3.1-0            labeling_0.4.3           
+# [19] mvtnorm_1.2-5             spatstat.data_3.1-2       genefilter_1.84.0        
+# [22] pbapply_1.7-2             parallelly_1.37.1         plotrix_3.8-4            
+# [25] rstudioapi_0.16.0         RSQLite_2.3.7             generics_0.1.3           
+# [28] ica_1.0-3                 spatstat.random_3.2-3     zip_2.3.1                
+# [31] fansi_1.0.6               abind_1.4-5               lifecycle_1.0.4          
+# [34] multcomp_1.4-25           yaml_2.3.8                edgeR_4.0.16             
+# [37] mathjaxr_1.6-0            SparseArray_1.2.4         Rtsne_0.17               
+# [40] grid_4.3.3                blob_1.2.4                promises_1.3.0           
+# [43] crayon_1.5.3              miniUI_0.1.1.1            lattice_0.22-6           
+# [46] annotate_1.80.0           KEGGREST_1.42.0           pillar_1.9.0             
+# [49] knitr_1.47                future.apply_1.11.2       codetools_0.2-20         
+# [52] leiden_0.4.3.1            mutoss_0.1-13             glue_1.7.0               
+# [55] data.table_1.15.4         vctrs_0.6.5               png_0.1-8                
+# [58] spam_2.10-0               Rdpack_2.6                gtable_0.3.5             
+# [61] cachem_1.1.0              xfun_0.45                 rbibutils_2.2.16         
+# [64] S4Arrays_1.2.1            mime_0.12                 tidygraph_1.3.1          
+# [67] survival_3.7-0            statmod_1.5.0             fitdistrplus_1.1-11      
+# [70] TH.data_1.1-2             ROCR_1.0-11               nlme_3.1-165             
+# [73] bit64_4.0.5               RcppAnnoy_0.0.22          irlba_2.3.5.1            
+# [76] KernSmooth_2.23-24        colorspace_2.1-0          DBI_1.2.3                
+# [79] mnormt_2.1.1              tidyselect_1.2.1          bit_4.0.5                
+# [82] compiler_4.3.3            TFisher_0.2.0             DelayedArray_0.28.0      
+# [85] plotly_4.10.4             lmtest_0.9-40             digest_0.6.36            
+# [88] goftest_1.2-3             spatstat.utils_3.0-5      rmarkdown_2.27           
+# [91] XVector_0.42.0            htmltools_0.5.8.1         pkgconfig_2.0.3          
+# [94] sparseMatrixStats_1.14.0  fastmap_1.2.0             rlang_1.1.4              
+# [97] htmlwidgets_1.6.4         shiny_1.8.1.1             DelayedMatrixStats_1.24.0
+#[100] farver_2.1.2              zoo_1.8-12                jsonlite_1.8.8           
+#[103] BiocParallel_1.36.0       GenomeInfoDbData_1.2.11   dotCall64_1.1-1          
+#[106] munsell_0.5.1             Rcpp_1.0.12               viridis_0.6.5            
+#[109] reticulate_1.37.0         stringi_1.8.4             zlibbioc_1.48.2          
+#[112] MASS_7.3-60.0.1           plyr_1.8.9                parallel_4.3.3           
+#[115] listenv_0.9.1             deldir_2.0-4              Biostrings_2.70.3        
+#[118] graphlayouts_1.1.1        splines_4.3.3             tensor_1.5               
+#[121] multtest_2.58.0           hms_1.1.3                 locfit_1.5-9.10          
+#[124] qqconf_1.3.2              igraph_2.0.3              spatstat.geom_3.2-9      
+#[127] RcppHNSW_0.6.0            softImpute_1.4-1          reshape2_1.4.4           
+#[130] XML_3.99-0.17             evaluate_0.24.0           tzdb_0.4.0               
+#[133] tweenr_2.0.3              httpuv_1.6.15             RANN_2.6.1               
+#[136] polyclip_1.10-6           future_1.33.2             scattermore_1.2          
+#[139] ggforce_0.4.2             xtable_1.8-4              RSpectra_0.16-1          
+#[142] later_1.3.2               viridisLite_0.4.2         memoise_2.0.1            
+#[145] AnnotationDbi_1.64.1      cluster_2.1.6             timechange_0.3.0         
+#[148] globals_0.16.3  
+```
+
+
