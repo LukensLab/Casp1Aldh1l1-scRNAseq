@@ -200,48 +200,23 @@ dev.off()
 
 
 # PLOT: proportion of cells in each cluster by sample
-pdf("cell_proportions.pdf",width=5,height=8)
-ggplot(seurat_clustered_labeled@meta.data) +
-    theme_classic() +
-    theme(axis.text.x = element_text(color="#000000",size=12),
-              axis.text.y = element_text(color="#000000", size=12),
+prop <- n_cells %>%
+  group_by(ident) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup()
+
+pdf("cell_props.pdf",width=4,height=6)
+ggplot(prop, aes(x = ident, 
+                 y = proportion, 
+                 fill = sample)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(color="#000000",size=12),
+          axis.text.y = element_text(color="#000000", size=12),
           axis.title.x = element_text(size = 12)) +
-    scale_x_discrete(labels=
-                    c("0" = "Astrocytes",
-                                         "1" = "Microglia", 
-                                         "2" = "Endothelial Cells",
-                                         "3" = "Oligodendrocytes",
-                                         "4" = "Astrocytes",
-                                         "5" = "Smooth Muscle Cells",
-                                         "6" = "Pericytes",
-                                         "7" = "Microglia",
-                                         "8" = "Astrocytes",
-                                         "9" = "Endothelial Cells",
-                                         "10" = "Neurons",
-                                         "11" = "OPCs",
-                                         "12" = "Neurons",
-                                         "13" = "BAMs",
-                                         "14" = "Oligodendrocytes",
-                                         "15" = "Tanycytes",
-                                         "16" = "CP cells",
-                                         "17" = "Immature Neurons",
-                                         "18" = "T cells",
-                                         "19" = "Astrocytes",
-                                         "20" = "Macrophages", 
-                                         "21" = "Oligodendrocytes", 
-                                         "22" = "Pericytes",
-                                         "23" = "Fibroblasts",
-                                         "24" = "Endothelial Cells", 
-                                         "25" = "B cells",
-                                         "26" = "Endothelial Cells",
-                                         "27" = "Immature Neurons")) +
-    scale_fill_manual(values=c("grey75", "seagreen2")) +
-    xlab(" ") + 
-    ylab("Proportion of cells") +
-    coord_flip() +
-    geom_bar(aes(x=integrated_snn_res.0.4, 
-                 fill=sample), 
-                  position=position_fill()) + NoLegend()
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "", y = "Proportion of Cells") +
+  coord_flip() +
+  scale_fill_manual(values=c("grey75", "seagreen2")) + NoLegend()
 dev.off()
 
 ```
